@@ -1,0 +1,114 @@
+---
+title: "foodb analysis"
+output: html_document
+date: "2025-02-19"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Packages inladen
+
+```{r}
+library(dplyr)
+```
+Data inladen
+
+```{r}
+foodb <- read.csv("C:\\Users\\bramd_finhsgu\\OneDrive - UGent\\Thesis\\Thesis_scripts\\Masterthesis_2425_Bram_Duthoo\\scripts\\foodb\\foodb_data.csv", header = TRUE)
+
+foodb_nutrient <- foodb %>%
+  filter(source_type == "Nutrient") %>%
+  select(-source_type)
+
+foodb_compound <- foodb %>%
+  filter(source_type == "Compound") %>%
+  select(-source_type)
+```
+
+
+```{r}
+# Zoek ID's die meerdere namen hebben
+duplicates_id <- foodb_compound %>%
+  group_by(orig_food_id) %>%
+  summarise(
+    n_unique = n_distinct(orig_food_common_name),
+    unique_names = paste(unique(orig_food_common_name), collapse = "; ")
+  ) %>%
+  filter(n_unique > 1)
+
+print(duplicates_id)
+
+# Zoek namen die meerdere ID's hebben
+duplicates_name <- foodb_compound %>%
+  group_by(orig_food_common_name) %>%
+  summarise(
+    n_unique = n_distinct(orig_food_id),
+    unique_ids = paste(unique(orig_food_id), collapse = ", ")
+  ) %>%
+  filter(n_unique > 1)
+
+print(duplicates_name)
+```
+
+```{r}
+# Stap 1: Bereken het totaal aantal unieke orig_source_ids
+total_unique_source_ids <- foodb_compound %>%
+  summarise(total_unique = n_distinct(source_id)) %>%
+  pull(total_unique)
+
+# Stap 2a: Bereken per food_id en per orig_food_id hoeveel unieke orig_source_ids er zijn
+food_id_food_summary <- foodb_compound %>%
+  group_by(food_id, orig_food_id) %>%
+  summarise(
+    unique_source_ids = n_distinct(source_id),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    percent_unique_source_ids = (unique_source_ids / total_unique_source_ids) * 100
+  )
+
+# Stap 2b: Selecteer orig_food_ids die onder de 40% zitten
+low_percentage_food_ids <- food_id_food_summary %>%
+  filter(percent_unique_source_ids < 40) %>%
+  select(food_id, orig_food_id, percent_unique_source_ids)
+
+# Stap 2c: Filter voor de berekening van het gemiddelde alleen orig_food_ids met ≥ 40% gebruik van orig_source_id
+filtered_food_id_summary <- food_id_food_summary %>%
+  filter(percent_unique_source_ids >= 40) %>%
+  group_by(food_id) %>%
+  summarise(
+    unique_orig_food_ids = n_distinct(orig_food_id),
+    avg_percent_unique_source_ids = mean(percent_unique_source_ids, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Resultaten printen
+print(filtered_food_id_summary)
+
+# Opslaan voor verdere filtering (optioneel)
+# write.csv(low_percentage_food_ids, "low_percentage_food_ids.csv", row.names = FALSE)
+
+# Totaal aantal unieke orig_source_ids
+print(paste("Totaal aantal unieke source_ids:", total_unique_source_ids))
+```
+
+```{r}
+foodb_compound <- foodb_compound %>%
+  filter(!(orig_food_id %in% low_percentage_food_ids$orig_food_id))
+```
+
+```{r}
+unit_distribution <- foodb_compound %>%
+  group_by(orig_unit) %>%
+  summarise(
+    count = n(),  # Aantal keer dat de unit voorkomt
+    unique_source_ids = n_distinct(source_id),  # Aantal unieke source_id's binnen de unit
+    percentage = (count / nrow(foodb_compound)) * 100  # Percentage voorkomen van de unit
+  ) %>%
+  arrange(desc(percentage))  # Sorteer op hoogste percentage eerst
+
+print(unit_distribution)
+```
+
