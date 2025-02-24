@@ -12,7 +12,13 @@ Packages inladen
 
 ```{r}
 library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(compositions)
+library(ggrepel)
+library(broom)
 ```
+
 Data inladen
 
 ```{r}
@@ -27,88 +33,281 @@ foodb_compound <- foodb %>%
   select(-source_type)
 ```
 
+foodb_compound omzetten in dataframe voor verdere bewerkingen + aanmaken food & source id lookup tabel voor interpretatie resultaten.
 
 ```{r}
-# Zoek ID's die meerdere namen hebben
-duplicates_id <- foodb_compound %>%
+# Stap 1: Creëer de eerste dataframe
+recepten <- foodb_compound %>%
+  select(orig_food_id, source_id, converted_value) %>%
+  pivot_wider(names_from = source_id, values_from = converted_value, values_fn = list(converted_value = mean), values_fill = 0)
+
+# Stap 2: Creëer de tweede dataframe
+food_id_lookup <- foodb_compound %>%
+  select(orig_food_id, food_id, orig_food_common_name) %>%
+  distinct() %>%
+  arrange(orig_food_id)
+
+# Stap 3: Creëer de derde dataframe
+source_id_lookup <- foodb_compound %>%
+  select(source_id, orig_source_name, subklass) %>%
+  distinct() %>%
+  arrange(source_id)
+
+# Toon de dataframes
+print(recepten)
+print(food_id_lookup)
+print(source_id_lookup)
+
+```
+
+Data verkenning source_ids (alle verschillende compounds), distributie over alle food_id's (~recepten) indien sample size groot/relevant genoeg is. Grens ligt momenteel op 100, handmatig gekozen om veel recepten, met weinig nulwaardes, over te houden. Echter geen volledig correcte manier van compounds verwijderen, idee: a) alle compounds met in elk recept een nulwaarde verwijderen. b) Belang compounds bepalen binnenin een food_id (diersoort). d.w.z. dat compounds die binnenin een food_id voor bijna elk recept voorkomen belangrijk zijn om te behouden, ook al is het totaal aantal nulwaarden over alle food_id's heel groot. Compounds die over elke food_id een verdeling hebben van niet nul-waarden % die onder een drempel ligt worden verwijderd.
+
+```{r}
+# Bereken percentage nulwaarden per orig_food_id
+percentage_nulwaarden <- recepten %>%
+  mutate(total_values = rowSums(. != 0),  # Tel niet-nulwaarden
+         total_columns = ncol(.) - 1,  # Aantal bron ID's (kolommen) minus orig_food_id
+         percentage_nul = (total_columns - total_values) / total_columns * 100) %>%
+  select(orig_food_id, percentage_nul)
+
+print(percentage_nulwaarden)
+
+# Groeperen en tellen van niet-nulwaarden per source_id
+recepten_long <- recepten %>%
+  pivot_longer(-orig_food_id, names_to = "source_id", values_to = "value") %>%
+  group_by(source_id) %>%
+  summarise(n_niet_nul = sum(value != 0),
+            n_nul = sum(value == 0),
+            .groups = "drop") %>%
+  mutate(is_groot_genoeg = n_niet_nul >= 100)
+
+# Split de data op basis van het aantal niet-nulwaarden
+source_id_groot_genoeg <- recepten_long %>%
+  filter(is_groot_genoeg)
+
+source_id_te_weinig <- recepten_long %>%
+  filter(!is_groot_genoeg)
+
+recepten_long_full <- recepten %>%
+  pivot_longer(-orig_food_id, names_to = "source_id", values_to = "value")
+
+# Distributie voor source_id's met 25+ niet-nulwaarden
+for (id in source_id_groot_genoeg$source_id) {
+  p <- ggplot(recepten_long_full %>%
+                filter(source_id == id),
+              aes(x = value)) +
+    geom_histogram(bins = 30, fill = "blue", alpha = 0.7) +
+    ggtitle(paste("Distributie van source_id", id)) +
+    xlab("Waarden") +
+    ylab("Frequentie") +
+    theme_minimal()
+  
+  print(p)  # Dit zorgt ervoor dat de plots correct getoond worden
+}
+
+# Statistieken voor source_id's met minder dan 25 niet-nulwaarden
+stats_te_weinig <- source_id_te_weinig %>%
+  mutate(mean_nulwaarden = n_nul / (n_nul + n_niet_nul) * 100)
+
+# Bereken statistieken met de correcte dataset recepten_long_full
+summary_stats <- recepten_long_full %>%
+  filter(source_id %in% source_id_te_weinig$source_id) %>%
+  group_by(source_id) %>%  # Groepeer per source_id
+  summarise(
+    mean_value = mean(value, na.rm = TRUE),
+    median_value = median(value, na.rm = TRUE),
+    q25 = quantile(value, 0.25, na.rm = TRUE),
+    q75 = quantile(value, 0.75, na.rm = TRUE),
+    .groups = "drop"  # Zorgt ervoor dat het resultaat geen gegroepeerd dataframe is
+  )
+
+print(stats_te_weinig)
+print(summary_stats)
+```
+
+Visualizatie van het aantal recepten dat overeenkomt met het minimum aantal niet-nulwaarden %. Hulpmiddel bij evenwicht zoeken tussen genoeg recepten behouden en zo min mogelijk nulwaarden (probleem voor log-transformaties).
+
+```{r}
+# Stap 1: Filteren van source_id's met genoeg niet-nulwaarden
+groot_genoeg_ids <- source_id_groot_genoeg$source_id  # Veronderstel dat dit de correcte bron is
+
+# Stap 2: Bereken percentage niet-nulwaarden per orig_food_id
+percentage_niet_nul <- recepten_long_full %>%
+  filter(source_id %in% groot_genoeg_ids) %>%  # Beperk tot de relevante source_id's
   group_by(orig_food_id) %>%
   summarise(
-    n_unique = n_distinct(orig_food_common_name),
-    unique_names = paste(unique(orig_food_common_name), collapse = "; ")
-  ) %>%
-  filter(n_unique > 1)
-
-print(duplicates_id)
-
-# Zoek namen die meerdere ID's hebben
-duplicates_name <- foodb_compound %>%
-  group_by(orig_food_common_name) %>%
-  summarise(
-    n_unique = n_distinct(orig_food_id),
-    unique_ids = paste(unique(orig_food_id), collapse = ", ")
-  ) %>%
-  filter(n_unique > 1)
-
-print(duplicates_name)
-```
-
-```{r}
-# Stap 1: Bereken het totaal aantal unieke orig_source_ids
-total_unique_source_ids <- foodb_compound %>%
-  summarise(total_unique = n_distinct(source_id)) %>%
-  pull(total_unique)
-
-# Stap 2a: Bereken per food_id en per orig_food_id hoeveel unieke orig_source_ids er zijn
-food_id_food_summary <- foodb_compound %>%
-  group_by(food_id, orig_food_id) %>%
-  summarise(
-    unique_source_ids = n_distinct(source_id),
-    .groups = "drop"
-  ) %>%
-  mutate(
-    percent_unique_source_ids = (unique_source_ids / total_unique_source_ids) * 100
-  )
-
-# Stap 2b: Selecteer orig_food_ids die onder de 40% zitten
-low_percentage_food_ids <- food_id_food_summary %>%
-  filter(percent_unique_source_ids < 40) %>%
-  select(food_id, orig_food_id, percent_unique_source_ids)
-
-# Stap 2c: Filter voor de berekening van het gemiddelde alleen orig_food_ids met ≥ 40% gebruik van orig_source_id
-filtered_food_id_summary <- food_id_food_summary %>%
-  filter(percent_unique_source_ids >= 40) %>%
-  group_by(food_id) %>%
-  summarise(
-    unique_orig_food_ids = n_distinct(orig_food_id),
-    avg_percent_unique_source_ids = mean(percent_unique_source_ids, na.rm = TRUE),
+    total_values = n(),  # Aantal componenten (source_id's)
+    niet_nul_values = sum(value != 0, na.rm = TRUE),  # Aantal niet-nulwaarden
+    percentage_niet_nul = niet_nul_values / total_values * 100,  # Percentage niet-nulwaarden
     .groups = "drop"
   )
 
-# Resultaten printen
-print(filtered_food_id_summary)
+# Stap 2: Groepeer per percentage_niet_nul en tel het aantal orig_food_ids per groep
+cumulative_distribution <- percentage_niet_nul %>%
+  group_by(percentage_niet_nul) %>% 
+  summarise(count = n(), .groups = "drop") %>%  # Tel het aantal orig_food_ids per % niet-nulwaarde
+  arrange(desc(percentage_niet_nul)) %>%  # Sorteer van hoog naar laag
+  mutate(cumulative_count = cumsum(count)) %>%  # Cumulatieve som nemen
+  mutate(cumulative_percentage = cumulative_count / sum(count) * 100)  # Omzetten naar %
 
-# Opslaan voor verdere filtering (optioneel)
-# write.csv(low_percentage_food_ids, "low_percentage_food_ids.csv", row.names = FALSE)
+# Stap 3: Debugging - Check of cumulatieve verdeling correct werkt
+print(head(cumulative_distribution))  # Bekijk de eerste rijen om te zien of data klopt
 
-# Totaal aantal unieke orig_source_ids
-print(paste("Totaal aantal unieke source_ids:", total_unique_source_ids))
+# Stap 4: Visualiseer de cumulatieve verdeling
+ggplot(cumulative_distribution, aes(x = percentage_niet_nul, y = cumulative_count)) +
+  geom_line(color = "blue", size = 1) +
+  geom_area(fill = "lightblue", alpha = 0.5) +
+  scale_x_continuous(breaks = seq(0, 100, by = 5)) +  # X-as van 0% tot 100%
+  labs(
+    title = "Afnemende Cumulatieve Verdeler van Niet-Nulwaarden per Orig Food ID",
+    x = "Percentage Niet-Nulwaarden",
+    y = "Aantal Orig Food IDs met Minstens Dit Percentage"
+  ) +
+  theme_minimal()
 ```
+
+Resultaat voordien toonde aan dat 80% een goed evenwichtspunt is. Hieronder is een functie die het aantal recepten dat overeenkomt met een minimum % van niet nulwaarden = 80%, in functie toont van hoe streng compounds worden weggefilterd (zie n_niet_nul bij bereken van alle distributies).
 
 ```{r}
-foodb_compound <- foodb_compound %>%
-  filter(!(orig_food_id %in% low_percentage_food_ids$orig_food_id))
+library(tidyverse)
+
+# Stap 1: Groeperen en tellen van niet-nulwaarden per source_id
+recepten_long <- recepten %>%
+  pivot_longer(-orig_food_id, names_to = "source_id", values_to = "value") %>%
+  group_by(source_id) %>%
+  summarise(n_niet_nul = sum(value != 0),  # Tel aantal niet-nulwaarden
+            .groups = "drop")
+
+# Stap 2: Genereer een reeks drempelwaarden voor n_niet_nul
+drempels <- seq(10, max(recepten_long$n_niet_nul), by = 10)
+
+# Stap 3: Iteratief filteren en opslaan hoeveel orig_food_id's een niet-nulpercentage ≥ 80% behouden
+resultaten <- map_dfr(drempels, function(drempel) {
+  
+  # Filter source_id's met minstens 'drempel' niet-nulwaarden
+  relevante_source_ids <- recepten_long %>%
+    filter(n_niet_nul >= drempel) %>%
+    pull(source_id)
+  
+  # Filter recepten_long_full om alleen relevante source_id's te behouden
+  percentage_niet_nul <- recepten %>%
+    pivot_longer(-orig_food_id, names_to = "source_id", values_to = "value") %>%
+    filter(source_id %in% relevante_source_ids) %>%
+    group_by(orig_food_id) %>%
+    summarise(
+      total_values = n(),  
+      niet_nul_values = sum(value != 0, na.rm = TRUE),
+      percentage_niet_nul = niet_nul_values / total_values * 100,
+      .groups = "drop"
+    )
+  
+  # Bepaal hoeveel orig_food_id's nog steeds een niet-nulpercentage ≥ 80% hebben
+  aantal_boven_80 <- sum(percentage_niet_nul$percentage_niet_nul >= 80)
+  
+  tibble(n_niet_nul_drempel = drempel, aantal_orig_food_boven_80 = aantal_boven_80)
+})
+
+# Stap 4: Visualiseer het effect van de drempel op het aantal orig_food_id's met ≥80% niet-nulwaarden
+ggplot(resultaten, aes(x = n_niet_nul_drempel, y = aantal_orig_food_boven_80)) +
+  geom_line(color = "blue", size = 1) +
+  geom_point(color = "red", size = 2) +
+  labs(
+    title = "Effect van n_niet_nul-drempel op het aantal orig_food_id's met ≥80% niet-nulwaarden",
+    x = "Minimum aantal niet-nulwaarden per source_id",
+    y = "Aantal orig_food_id's met ≥80% niet-nulwaarden"
+  ) +
+  theme_minimal()
+
 ```
+
+Data filteren op basis van vorige resultaten voor outlier detecte en PCA. Nog eens orig_food_id filter nakijken in vscode script aangezien er nog sommige ongewenste id's doorkomen. Herbekijken na gebruik van andere source_id filtering.
 
 ```{r}
-unit_distribution <- foodb_compound %>%
-  group_by(orig_unit) %>%
-  summarise(
-    count = n(),  # Aantal keer dat de unit voorkomt
-    unique_source_ids = n_distinct(source_id),  # Aantal unieke source_id's binnen de unit
-    percentage = (count / nrow(foodb_compound)) * 100  # Percentage voorkomen van de unit
-  ) %>%
-  arrange(desc(percentage))  # Sorteer op hoogste percentage eerst
+extra_ids <- c("10005", "10102", "36014", "36015", "36016", "36017", "36018", "36019", "36020", "36021",
+               "36022", "36023", "36024", "13000", "13047", "17271", "17222", "10100", "10174", "13097",
+               "13227", "13976", "13978", "17099", "17107", "17113", "17119", "17125", "17131", "17137",
+               "17140", "17278", "23513", "13095", "13284", "13147", "13149", "13339", "17128", "17276",
+               "13838", "13841", "13844", "13847", "13859", "23623", "322", "323", "428", "13023",
+               "10072", "10121", "10187", "10219", "10228", "17110", "17142")  # Voeg hier je specifieke ID's toe
 
-print(unit_distribution)
+selected_orig_food_ids <- percentage_niet_nul %>%
+  filter(percentage_niet_nul >= 79 | orig_food_id %in% extra_ids) %>%
+  pull(orig_food_id)  # Haal de waarden op als een vector
+
+# Stap 2: Filter recepten_long_full op deze orig_food_id's en groot_genoeg_ids
+FOODB_MEAT <- recepten_long_full %>%
+  filter(orig_food_id %in% selected_orig_food_ids & source_id %in% groot_genoeg_ids)
+
 ```
 
+Als epsilon = min. waarde in dataset / 10. Controleren of dit klein genoeg is, + gevoeligheidsanalyse voor epsilon waarde.
+ILR als standaard log-transformatie genomen, kan nog eens vergeleken worden met andere transformaties.
+
+
+```{r}
+# Stap 1: Data omzetten naar brede vorm (compositie per orig_food_id)
+foodb_wide <- FOODB_MEAT %>%
+  pivot_wider(names_from = source_id, values_from = value, values_fill = 0) %>%
+  column_to_rownames("orig_food_id")  # Zet orig_food_id als rijnaam
+
+# Stap 2: Vervang nullen door epsilon (klein getal om logproblemen te vermijden)
+epsilon <- 1e-6
+foodb_no_zeros <- foodb_wide %>%
+  mutate(across(everything(), ~ ifelse(. == 0, epsilon, .)))
+
+# Stap 3: Normaliseren (compositiesommen moeten gelijk zijn aan 1)
+foodb_composition <- foodb_no_zeros %>%
+  mutate(across(everything(), ~ . / rowSums(foodb_no_zeros, na.rm = TRUE)))
+
+# Stap 4: ILR-transformatie uitvoeren
+foodb_ilr <- compositions::ilr(foodb_composition)
+```
+
+Mahalanobis-afstanden & PCA hebben multivariate normaliteit als voorwaarde, deze voorwaarde moet beter worden nagegaan om geloofwaardigheid resultaten in te schatten.
+
+```{r}
+# Stap 1: Normaliteitstest uitvoeren op ILR-getransformeerde data
+foodb_ilr_df <- as.data.frame(foodb_ilr)
+
+normality_results <- foodb_ilr_df %>%
+  # Gebruik reframe() om een data frame met meerdere waarden per kolom te retourneren
+  reframe(across(everything(), ~ {
+    shapiro_test <- shapiro.test(.)  # Voer de Shapiro-test uit
+    data.frame(statistic = shapiro_test$statistic, p_value = shapiro_test$p.value)
+  })) %>%
+  pivot_longer(cols = everything(), names_to = "compound", values_to = "measure") %>%
+  unnest(cols = measure)  # Maak de data frame breed
+
+# Print resultaten
+print(normality_results)
+
+# Stap 5: Outlierdetectie met Mahalanobis-afstanden
+mahal_distances <- mahalanobis(foodb_ilr, colMeans(foodb_ilr, na.rm = TRUE), cov(foodb_ilr, use = "pairwise.complete.obs"))
+threshold <- qchisq(0.975, df = ncol(foodb_ilr))  # 97.5% grenswaarde
+outliers <- which(mahal_distances > threshold)
+
+# Lijst van outliers
+list_of_outliers <- rownames(foodb_ilr)[outliers]
+print("Outliers gevonden op basis van Mahalanobis-afstanden:")
+print(list_of_outliers)
+
+# Stap 6: PCA uitvoeren op ILR-getransformeerde data
+pca_model <- prcomp(foodb_ilr, scale. = FALSE)
+
+pca_df <- as.data.frame(pca_model$x) %>%
+  rownames_to_column("orig_food_id") %>%
+  mutate(orig_food_id = as.character(orig_food_id)) %>%  # Zorg dat het character is
+  left_join(food_id_lookup %>% mutate(orig_food_id = as.character(orig_food_id)), by = "orig_food_id")  # Voeg food_id toe voor kleur
+
+# Stap 8: PCA plotten (kleur per food_id)
+ggplot(pca_df, aes(x = PC1, y = PC2, color = as.factor(food_id), label = orig_food_id)) +
+  geom_point(size = 3, alpha = 0.8) +
+  geom_text_repel(size = 3) +
+  labs(title = "PCA van Meat Composition Data",
+       x = "Principal Component 1",
+       y = "Principal Component 2",
+       color = "Food ID") +
+  theme_minimal()
+
+```
+Food ID 334 = kip, 483 = schaap, 506 = rund, 549 = varken.
