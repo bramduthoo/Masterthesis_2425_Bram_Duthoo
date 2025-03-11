@@ -1,0 +1,1119 @@
+# Data exploratie
+
+---
+title: "Meat Flavor Compositional Analysis"
+author: "Bram Duthoo"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 7)
+```
+
+## 1. Load Libraries
+
+```{r load-libraries}
+# Load required libraries
+library(compositions)
+library(zCompositions)
+library(ggplot2)
+library(factoextra)
+library(vegan)
+library(tidyverse)
+library(pheatmap)
+library(RColorBrewer)
+library(gridExtra)
+library(dplyr)
+```
+
+## 2. Load and Process Data
+
+```{r load-data}
+# Data inladen
+foodb <- read.csv("C:\\Users\\bramd_finhsgu\\OneDrive - UGent\\Thesis\\Thesis_scripts\\Masterthesis_2425_Bram_Duthoo\\scripts\\foodb\\foodb_data.csv", header = TRUE)
+foodb_nutrient <- foodb %>%
+  filter(source_type == "Nutrient") %>%
+  dplyr::select(-source_type)
+foodb_compound <- foodb %>%
+  filter(source_type == "Compound") %>%
+  dplyr::select(-source_type)
+# Objecten aanmaken
+recepten <- foodb_compound %>%
+  dplyr::select(orig_food_id, source_id, converted_value) %>%
+  pivot_wider(names_from = source_id, values_from = converted_value, values_fn = list(converted_value = mean), values_fill = 0.00)
+food_id_lookup <- foodb_compound %>%
+  dplyr::select(orig_food_id, food_id, orig_food_common_name) %>%
+  arrange(orig_food_id) %>%  # Eerst sorteren op orig_food_id
+  distinct(orig_food_id, .keep_all = TRUE)
+source_id_lookup <- foodb_compound %>%
+  dplyr::select(source_id, orig_source_name, subklass) %>%
+  distinct() %>%
+  arrange(source_id) 
+source_id_lookup_fixed <- source_id_lookup %>%
+  mutate(source_id_with_x = paste0("X", source_id))
+```
+
+## 3. Create Metadata and Define Animal Types
+
+```{r create-metadata}
+# Join lookup information to the main dataframe
+recepten_with_info <- recepten %>%
+  left_join(food_id_lookup, by = "orig_food_id")
+
+# Create an animal type column based on food_id
+recepten_with_info <- recepten_with_info %>%
+  mutate(animal_type = case_when(
+    food_id == 506 ~ "beef",
+    food_id == 549 ~ "pork",
+    food_id == 334 ~ "chicken",
+    food_id == 483 ~ "mutton",
+    TRUE ~ "unknown"
+  ))
+
+# Extract metadata for later use
+metadata <- recepten_with_info %>%
+  dplyr::select(orig_food_id, food_id, animal_type, orig_food_common_name)
+
+# Summary of data by animal type
+animal_summary <- metadata %>%
+  group_by(animal_type) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+print(animal_summary)
+```
+
+## 4. Approach 1: Complete Dataset Analysis
+
+### 4.1 Data Preparation
+
+In deze sectie wordt de data log-getransformeerd. Aangezien log-transformaties niet mogelijk zijn op nulwaarden, is een imputatie hiervan nodig.
+Om te bepalen op welke manier dit best gebeurd dienen de nulwaarden geclassifieerd te worden:
+- Rounded zeros: Deze nulwaarden representeren geen echte 0. Dit zijn vaak waarden die onder een detectielimiet liggen, of niet gewoon niet gemeten zijn.
+- Structural zeros: Deze nulwaarden representeren een echte 0.
+(aanvullen met nulwaardes klasse, zie paper)
+In dit geval zijn de nulwaarden structural zeros aangezien er wel degelijk compounds bestaan die niet aanwezig zijn in sommige dieren/vleesdelen. Er bestaat helaas nog geen perfecte manier om om te gaan met structural zeros sinds het een echte 0 representeert, en imputaties dus voor informatieverlies over de afwezigheid zorgen. De beste strategie hiervoor is dus afhankelijk van de data, onderzoeksvraag en context, en ook robust.
+In dit geval is er geopteerd voor het imputeren van zeer kleine waardes (1e-7, kleinste waarde in dataset = 1.25e-5) zodat deze na de transformatie relatief met de data klein blijven en 0 benaderen. Het toevoegen van steeds kleinere waardes brengt echter het risico met zich mee dat de data extremer zal vervormen. Om dit risico in te schatten is er een sensiviteitsanalyse toegepast op de imputatiewaarde die deed blijken dat de methode zeer robust is. Over een grootorde van 1e5, daalde de verklaarde variantie van de eerste 2 PC met slechts 2% wat bewijst dat de patronen en achterliggende compositie relaties in de data behouden worden . De resultaten worden dus ook niet beïnvloedt door de imputatiewaarde gekozen.
+
+```{r full-data-prep}
+# Remove compounds with all zeros
+zero_compounds <- names(recepten)[which(colSums(recepten[, -1] == 0) == nrow(recepten)) + 1]
+recepten_filtered_full <- recepten %>% dplyr::select(-all_of(zero_compounds))
+
+# Create a sample identity dataframe
+sample_ids_full <- data.frame(
+  row_index = 1:nrow(recepten_filtered_full),
+  orig_food_id = recepten_filtered_full$orig_food_id
+)
+
+# Extract just the compound columns for compositional analysis
+recepten_comp_cols_full <- recepten_filtered_full %>% dplyr::select(-orig_food_id)
+
+# Replace zeros with 1e-7 (chosen based on sensitivity analysis)
+recepten_no_zeros <- as.data.frame(recepten_comp_cols_full)
+for(col in colnames(recepten_no_zeros)) {
+  recepten_no_zeros[recepten_no_zeros[,col] == 0, col] <- 1e-7
+}
+
+# Convert to compositional form
+recepten_comp_full <- recepten_no_zeros / rowSums(recepten_no_zeros)
+
+# Add row indices and sample IDs
+recepten_comp_with_ids <- cbind(
+  orig_food_id = recepten_filtered_full$orig_food_id,
+  recepten_comp_full
+)
+
+# Create compositional data objects
+recepten_acomp_full <- acomp(recepten_comp_full)
+
+# Apply CLR and ILR transformations
+recepten_clr_full <- compositions::clr(recepten_acomp_full)
+recepten_ilr_full <- compositions::ilr(recepten_acomp_full)
+
+# Create dataframes with row identifiers
+clr_with_index_full <- data.frame(
+  row_index = 1:nrow(recepten_clr_full),
+  as.data.frame(recepten_clr_full)
+)
+
+# Join back to sample IDs
+clr_with_ids_full <- clr_with_index_full %>%
+  left_join(sample_ids_full, by = "row_index")
+
+# Join CLR data with metadata
+clr_with_metadata_full <- clr_with_ids_full %>%
+  left_join(metadata, by = "orig_food_id")
+```
+
+
+### 4.1.1 Sensitivity Analysis for Zero Replacement
+```{r zero-sensitivity}
+# Function to replace zeros with a constant and normalize
+replace_zeros <- function(data, value) {
+  # Create a copy of the data
+  data_no_zeros <- as.data.frame(data)
+  
+  # Replace zeros with the specified value
+  for(col in colnames(data_no_zeros)) {
+    data_no_zeros[data_no_zeros[,col] == 0, col] <- value
+  }
+  
+  # Normalize to sum to 1
+  row_sums <- rowSums(data_no_zeros)
+  data_comp <- data_no_zeros / row_sums
+  
+  return(data_comp)
+}
+
+# Try different replacement values
+replacement_values <- c(1e-10, 1e-9, 1e-8, 1e-7, 1e-6, 1e-5)
+results_constant <- list()
+
+for(value in replacement_values) {
+  # Replace zeros
+  temp_data <- replace_zeros(recepten_comp_cols_full, value)
+  
+  # Create compositional object
+  temp_acomp <- acomp(temp_data)
+  
+  # CLR transform
+  temp_clr <- compositions::clr(temp_acomp)
+  
+  # PCA
+  temp_pca <- prcomp(temp_clr)
+  
+  # Store results
+  results_constant[[as.character(value)]] <- list(
+    pca = temp_pca,
+    var_explained = summary(temp_pca)$importance[2,1:2]
+  )
+}
+
+# Compare variance explained
+var_compared_constant <- data.frame(
+  Value = names(results_constant),
+  PC1 = sapply(results_constant, function(x) x$var_explained[1]),
+  PC2 = sapply(results_constant, function(x) x$var_explained[2]),
+  Total = sapply(results_constant, function(x) sum(x$var_explained))
+)
+
+# Display results
+print(var_compared_constant)
+
+# Plot variance explained by imputation value
+ggplot(var_compared_constant, aes(x = Value, y = Total, group = 1)) +
+  geom_line() +
+  geom_point() +
+  theme_bw() +
+  labs(title = "Effect of Zero Imputation Value on Variance Explained",
+       x = "Imputation Value",
+       y = "Total Variance Explained (PC1+PC2)")
+```
+
+
+### 4.2 Principal Component Analysis
+
+```{r full-pca}
+# Extract just the CLR-transformed data for PCA (no IDs or metadata)
+pca_input_full <- clr_with_ids_full %>% dplyr::select(-row_index, -orig_food_id)
+
+# Run the PCA
+recepten_pca_full <- prcomp(pca_input_full, scale. = FALSE)
+
+# Create a dataframe with PCA scores and row indices
+pca_scores_full <- data.frame(
+  row_index = 1:nrow(recepten_pca_full$x),
+  as.data.frame(recepten_pca_full$x)
+)
+
+# Join PCA scores back to sample IDs
+pca_with_ids_full <- pca_scores_full %>%
+  left_join(sample_ids_full, by = "row_index")
+
+# Join with metadata for plotting and analysis
+pca_with_metadata_full <- pca_with_ids_full %>%
+  left_join(metadata, by = "orig_food_id")
+
+# Variance explained by PCs
+pca_var_full <- summary(recepten_pca_full)$importance[2,] * 100
+pc1_var_full <- round(pca_var_full[1], 1)
+pc2_var_full <- round(pca_var_full[2], 1)
+total_var_full <- round(pc1_var_full + pc2_var_full, 1)
+
+cat(paste("Variance explained by PC1:", pc1_var_full, "%\n"))
+cat(paste("Variance explained by PC2:", pc2_var_full, "%\n"))
+cat(paste("Total variance explained by PC1+PC2:", total_var_full, "%\n"))
+```
+In een dataset met 101 compounds is een verklaarde variatie van 53.7% door de eerste 2 PC's vrij goed.
+Deze PC's zijn een lineaire combinatie van alle compounds, en wijzen een richting van variatie aan. Exploratieve analyse, resultaten hebben geen toepassing verder.
+
+### 4.3 PCA Visualization
+
+```{r full-pca-plot}
+# Define consistent color scheme
+animal_colors <- c("beef" = "red", "pork" = "blue", "chicken" = "green", "mutton" = "purple")
+
+# PCA plot using fviz_pca_ind
+pca_plot_full <- fviz_pca_ind(recepten_pca_full,
+                             geom = "point",
+                             habillage = pca_with_metadata_full$animal_type,
+                             palette = animal_colors,
+                             addEllipses = TRUE,
+                             ellipse.type = "t",
+                             pointsize = 3,
+                             alpha.ind = 0.7) +
+  theme_bw() +
+  labs(title = "PCA of Meat Compositions by Animal Type (Full Dataset)",
+       x = paste0("PC1 (", pc1_var_full, "%)"),
+       y = paste0("PC2 (", pc2_var_full, "%)"))
+
+# Display the PCA plot
+print(pca_plot_full)
+
+# Voor de gefacetteerde versie, kijk naar de structuur van het fviz object
+# en gebruik de correcte data component
+# Hier gebruiken we een alternatieve aanpak met de originele PCA scores
+
+# Maak een dataframe met PC1, PC2 en animal_type
+pca_data_for_facet <- data.frame(
+  PC1 = recepten_pca_full$x[,1],
+  PC2 = recepten_pca_full$x[,2],
+  animal_type = pca_with_metadata_full$animal_type
+)
+
+# Creëer de gefacetteerde plot met ggplot2
+pca_plot_full_facet <- ggplot(pca_data_for_facet, aes(x = PC1, y = PC2, color = animal_type)) +
+  geom_point(size = 3, alpha = 0.7) +
+  facet_wrap(~animal_type) +
+  scale_color_manual(values = animal_colors) +
+  theme_bw() +
+  labs(title = "PCA of Meat Compositions by Animal Type - Faceted (Full Dataset)",
+       x = paste0("PC1 (", pc1_var_full, "%)"),
+       y = paste0("PC2 (", pc2_var_full, "%)"),
+       color = "Animal Type")
+
+print(pca_plot_full_facet)
+```
+
+Positieve resultaten voor een exploratory analysis. Rund en varken clusteren samen, al is er variatie te zien binnenin de diersoorten die waarschijnlijk afkomstig is van andere factors zoals type vleesdeel, dieet dier, leeftijd etc. Bovendien is er een assymetrie in sample size over de dieren heen, en recepten ~= rijen, met veel nulwaarden die best gefilterd worden om enkel kwaliteitsvolle data te behouden indien er modellen worden gebouwd.
+
+### 4.4 Statistical Testing
+
+```{r full-permanova}
+# PERMANOVA to test differences between animal types
+recepten_dist_full <- dist(pca_input_full)
+permanova_result_full <- adonis2(recepten_dist_full ~ animal_type, data = pca_with_metadata_full)
+print(permanova_result_full)
+```
+Deze resultaten vertellen ons dat de relatie van de compositie en diersoort hoog significant is. De R² waarde vertelt ons hoeveel variatie er in totaal wordt verklaard door het soort dier, en is met 17% redelijk goed. Aangezien er zoveel compounds zijn, en zoveel andere factoren die invloed hebben (hiervoor besproken), is 10-20% (paper hiervoor terugvinden) voldoende voor één factor in complexe biologische studies. 
+De F statistiek vertelt ons hoeveel between group variation/ within group variation is. Een waarde van 31 wijst dus op een goede separatie van groepen tov de variatie in groepen, en dat het verschil tussen diersoorten dus veel groter is dan binnenin diersoorten.
+Dit combineren geeft bevestiging dat er een scheiding is van composities op basis van diersoorten, en een in depth-analyse de moeite waard is om deze relaties te onderzoeken
+
+### 4.5 Key Discriminating Compounds
+
+```{r full-discriminating-compounds}
+# Calculate the variance of each compound in clr-transformed space
+compound_variance_full <- data.frame(
+  source_id = colnames(recepten_comp_full),
+  variance = apply(recepten_clr_full, 2, var)
+)
+
+# Ensure source_id is character type for consistent joining
+compound_variance_full$source_id <- as.character(compound_variance_full$source_id)
+source_id_lookup$source_id <- as.character(source_id_lookup$source_id)
+
+# Create a deduplicated lookup table with one name per source_id
+source_id_lookup_unique <- source_id_lookup %>%
+  group_by(source_id) %>%
+  slice(1) %>%  # Take only the first entry for each source_id
+  ungroup() %>%
+  # Select only the columns we need
+  select(source_id, orig_source_name, subklass)
+
+# Join with the deduplicated lookup table
+compound_variance_full <- compound_variance_full %>%
+  left_join(source_id_lookup_unique, by = "source_id")
+
+# Sort compounds by variance to find the most discriminating ones
+top_compounds_full <- compound_variance_full %>%
+  arrange(desc(variance)) %>%
+  head(15)
+
+# Display results
+print(top_compounds_full)
+```
+
+Deze compound zijn degene die het meeste variantie verklaren in de dataset. Het is vooral de volgorde van hoogste variantie die belangrijk is om te bepalen welke compounds het verschil tussen dieren bepalen. Hieronder wordt een heatmap gemaakt van deze compounds om een simpele flavor map te maken op basis van de belangrijkste compounds voor elk dier om te tonen hoe de composities verschillen.
+
+### 4.6 Heatmap of Key Compounds
+
+```{r full-heatmap}
+# Create heatmap data
+top_compounds_ids_full <- top_compounds_full$source_id
+
+# Get mean values for each compound by animal type
+heatmap_data_full <- boxplot_data_full %>%
+  group_by(animal_type, source_id, orig_source_name) %>%
+  summarise(mean_concentration = mean(concentration, na.rm = TRUE),
+            .groups = "drop") %>%
+  pivot_wider(id_cols = c(animal_type), 
+              names_from = orig_source_name, 
+              values_from = mean_concentration)
+
+# Convert to matrix for heatmap
+heatmap_matrix_full <- as.matrix(heatmap_data_full[, -1])
+rownames(heatmap_matrix_full) <- heatmap_data_full$animal_type
+
+# Ensure no NA values in heatmap matrix
+heatmap_matrix_full[is.na(heatmap_matrix_full)] <- 0
+
+# Make sure you have more than one row
+if(nrow(heatmap_matrix_full) > 1) {
+  pheatmap(heatmap_matrix_full,
+           main = "Mean Concentration of Key Compounds by Animal Type (Full Dataset)",
+           color = colorRampPalette(c("white", "navy"))(100),
+           cluster_rows = FALSE,
+           scale = "column",
+           display_numbers = TRUE,
+           number_format = "%.1f",
+           fontsize_number = 8)
+}
+```
+
+## 5. Approach 2: Balanced Subset Analysis
+
+### 5.1 Create Balanced Subset
+
+```{r balanced-subset}
+# Use your subset filtering code
+selected_food_ids <- c(36014, 36015, 36016, 36017, 36018, 36021, 36022, 36023)
+extra_food_ids <- c(437, 438, 435, 417, 427, 440, 432, 373, 929, 5017, 918, 5004, 5018, 5007)
+selected_source_ids <- as.character(c(446, 465, 484, 556, 570, 1946, 2251, 2257, 2890, 2928, 2935, 2942, 2943, 2953, 
+                                     3004, 3006, 3011, 3103, 3307, 3337, 3772, 4288, 4677, 6288, 8425, 10035, 11678, 
+                                     11682, 11820, 11859, 11875, 12002, 12065, 12126, 12163, 12465, 12531, 12533, 
+                                     12566, 12636, 12686, 12742, 12881, 12890, 13900, 14708, 16140, 21947, 21973, 
+                                     21981, 24096))
+
+all_selected_food_ids <- c(selected_food_ids, extra_food_ids)
+
+# Filter recepten
+recepten_balanced <- recepten %>%
+  filter(orig_food_id %in% all_selected_food_ids) %>%  # Keep only relevant rows
+  dplyr::select(orig_food_id, any_of(selected_source_ids))  # Select relevant source_ids
+
+# Summary of balanced dataset
+balanced_metadata <- metadata %>%
+  filter(orig_food_id %in% all_selected_food_ids)
+
+balanced_summary <- balanced_metadata %>%
+  group_by(animal_type) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+print(balanced_summary)
+
+# Print food parts in the balanced dataset
+food_parts_summary <- balanced_metadata %>%
+  group_by(animal_type, orig_food_common_name) %>%
+  summarise(count = n(), .groups = "drop") %>%
+  arrange(animal_type, orig_food_common_name)
+
+print(food_parts_summary)
+```
+
+### 5.2 Balanced Dataset Compositional Analysis
+
+```{r balanced-coda}
+# Create a sample identity dataframe for balanced data
+# Remove compounds with all zeros
+zero_compounds_balanced <- names(recepten_balanced)[which(colSums(recepten_balanced[, -1] == 0) == nrow(recepten_balanced)) + 1]
+recepten_filtered_balanced <- recepten_balanced %>% dplyr::select(-all_of(zero_compounds_balanced))
+
+sample_ids_balanced <- data.frame(
+  row_index = 1:nrow(recepten_balanced),
+  orig_food_id = recepten_filtered_balanced$orig_food_id
+)
+
+# Extract just the compound columns for compositional analysis
+recepten_filtered_comp_cols_balanced <- recepten_filtered_balanced %>% dplyr::select(-orig_food_id)
+
+# Replace zeros with 1e-7 (chosen based on sensitivity analysis)
+recepten_balanced_no_zeros <- as.data.frame(recepten_filtered_comp_cols_balanced)
+for(col in colnames(recepten_balanced_no_zeros)) {
+  recepten_balanced_no_zeros[recepten_balanced_no_zeros[,col] == 0, col] <- 1e-7
+}
+
+# Convert to compositional form
+recepten_balanced_comp_full <- recepten_balanced_no_zeros / rowSums(recepten_balanced_no_zeros)
+
+# Add row indices and sample IDs
+recepten_filtered_comp_with_ids <- cbind(
+  orig_food_id = recepten_filtered_balanced$orig_food_id,
+  recepten_balanced_comp_full
+)
+
+# Create compositional data objects
+recepten_balanced_acomp_full <- acomp(recepten_balanced_comp_full)
+
+# Apply CLR and ILR transformations
+recepten_balanced_clr_full <- compositions::clr(recepten_balanced_acomp_full)
+recepten_balanced_ilr_full <- compositions::ilr(recepten_balanced_acomp_full)
+
+# Create dataframes with row identifiers
+clr_balanced_with_index_full <- data.frame(
+  row_index = 1:nrow(recepten_balanced_clr_full),
+  as.data.frame(recepten_balanced_clr_full)
+)
+
+# Join back to sample IDs
+clr_balanced_with_ids_full <- clr_balanced_with_index_full %>%
+  left_join(sample_ids_balanced, by = "row_index")
+
+# Join CLR data with metadata
+clr_balanced_with_metadata_full <- clr_balanced_with_ids_full %>%
+  left_join(metadata, by = "orig_food_id")
+```
+
+### 5.3 Balanced PCA Analysis
+
+```{r balanced-pca}
+# Extract just the CLR-transformed data for PCA (no IDs or metadata)
+pca_input_balanced <- clr_balanced_with_ids_full %>% dplyr::select(-row_index, -orig_food_id)
+
+# Run the PCA
+recepten_pca_balanced <- prcomp(pca_input_balanced, scale. = FALSE)
+
+# Create a dataframe with PCA scores and row indices
+pca_scores_balanced <- data.frame(
+  row_index = 1:nrow(recepten_pca_balanced$x),
+  as.data.frame(recepten_pca_balanced$x)
+)
+
+# Join PCA scores back to sample IDs
+pca_with_ids_balanced <- pca_scores_balanced %>%
+  left_join(sample_ids_balanced, by = "row_index")
+
+# Join with metadata for plotting and analysis
+pca_with_metadata_balanced <- pca_with_ids_balanced %>%
+  left_join(metadata, by = "orig_food_id")
+
+# Variance explained by PCs
+pca_var_balanced <- summary(recepten_pca_balanced)$importance[2,] * 100
+pc1_var_balanced <- round(pca_var_balanced[1], 1)
+pc2_var_balanced <- round(pca_var_balanced[2], 1)
+total_var_balanced <- round(pc1_var_balanced + pc2_var_balanced, 1)
+
+cat(paste("Variance explained by PC1:", pc1_var_balanced, "%\n"))
+cat(paste("Variance explained by PC2:", pc2_var_balanced, "%\n"))
+cat(paste("Total variance explained by PC1+PC2:", total_var_balanced, "%\n"))
+```
+
+### 5.4 Balanced PCA Visualization
+
+```{r balanced-pca-plot}
+# Define consistent color scheme
+animal_colors <- c("beef" = "red", "pork" = "blue", "chicken" = "green", "mutton" = "purple")
+
+# PCA plot using ggplot2
+pca_plot_balanced <- ggplot(pca_with_metadata_balanced, aes(x = PC1, y = PC2, color = animal_type)) +
+  geom_point(size = 3, alpha = 0.7) +
+  stat_ellipse(aes(color = animal_type), type = "t") +
+  scale_color_manual(values = animal_colors) +
+  theme_bw() +
+  labs(title = "PCA of Meat Compositions by Animal Type (Balanced Dataset)",
+       x = paste0("PC1 (", pc1_var_balanced, "%)"),
+       y = paste0("PC2 (", pc2_var_balanced, "%)"),
+       color = "Animal Type")
+
+# Display the PCA plot
+print(pca_plot_balanced)
+```
+
+### 5.5 Balanced Statistical Testing
+
+```{r balanced-permanova}
+# PERMANOVA to test differences between animal types
+recepten_dist_balanced <- dist(pca_input_balanced)
+permanova_result_balanced <- adonis2(recepten_dist_balanced ~ animal_type, data = pca_with_metadata_balanced)
+print(permanova_result_balanced)
+```
+
+### 5.6 Balanced Key Discriminating Compounds
+
+```{r balanced-discriminating-compounds}
+### 5.6 Balanced Key Discriminating Compounds
+
+# Calculate the variance of each compound in clr-transformed space
+compound_variance_balanced <- data.frame(
+  source_id = colnames(recepten_balanced_comp_full),
+  variance = apply(recepten_balanced_clr_full, 2, var)
+)
+
+# Ensure source_id is character type for consistent joining
+compound_variance_balanced$source_id <- as.character(compound_variance_balanced$source_id)
+source_id_lookup$source_id <- as.character(source_id_lookup$source_id)
+
+# Create a deduplicated lookup table with one name per source_id
+source_id_lookup_unique <- source_id_lookup %>%
+  group_by(source_id) %>%
+  slice(1) %>%  # Take only the first entry for each source_id
+  ungroup() %>%
+  # Select only the columns we need
+  select(source_id, orig_source_name, subklass)
+
+# Join with the deduplicated lookup table
+compound_variance_balanced <- compound_variance_balanced %>%
+  left_join(source_id_lookup_unique, by = "source_id")
+
+# Sort compounds by variance to find the most discriminating ones
+top_compounds_balanced <- compound_variance_balanced %>%
+  arrange(desc(variance)) %>%
+  head(15)
+
+# Display the top discriminating compounds
+print(top_compounds_balanced)
+
+# Prepare data for boxplots with original compound values
+orig_comp_data_balanced <- data.frame(
+  orig_food_id = recepten_filtered_balanced$orig_food_id,
+  recepten_filtered_balanced %>% dplyr::select(-orig_food_id)
+)
+
+# Create long data for boxplots
+boxplot_data_balanced <- orig_comp_data_balanced %>%
+  pivot_longer(cols = -orig_food_id, 
+               names_to = "source_id", 
+               values_to = "concentration") %>%
+  # Remove X prefix if present in source_id
+  mutate(source_id = gsub("^X", "", source_id)) %>%
+  filter(source_id %in% top_compounds_balanced$source_id) %>%
+  left_join(metadata, by = c("orig_food_id" = "orig_food_id")) %>%
+  left_join(source_id_lookup_unique, by = c("source_id" = "source_id"))
+
+# Check if we have data
+if(nrow(boxplot_data_balanced) == 0) {
+  warning("No data in boxplot_data_balanced after filtering")
+} else {
+  # Create a fallback label if orig_source_name is missing
+  boxplot_data_balanced <- boxplot_data_balanced %>%
+    mutate(plot_label = ifelse(is.na(orig_source_name), source_id, orig_source_name))
+  
+  # Create boxplots with compound names
+  boxplot_balanced <- ggplot(boxplot_data_balanced, 
+                           aes(x = animal_type, y = concentration, fill = animal_type)) +
+    geom_boxplot() +
+    facet_wrap(~ plot_label, scales = "free_y") +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_fill_manual(values = animal_colors) +
+    labs(title = "Key Discriminating Compounds Across Animal Types (Balanced Dataset)",
+         y = "Concentration (mg/100g)",
+         x = "Animal Type")
+  
+  print(boxplot_balanced)
+}
+```
+
+### 5.7 Balanced Heatmap
+
+```{r balanced-heatmap}
+# Create heatmap data from the boxplot data
+# Get mean values for each compound by animal type
+heatmap_data_balanced <- boxplot_data_balanced %>%
+  group_by(animal_type, source_id, plot_label) %>%
+  summarise(mean_concentration = mean(concentration, na.rm = TRUE),
+            .groups = "drop") %>%
+  pivot_wider(id_cols = c(animal_type), 
+              names_from = plot_label, 
+              values_from = mean_concentration)
+
+# Check if we have data
+if(ncol(heatmap_data_balanced) <= 1) {
+  warning("Not enough data for heatmap - check if compounds were properly mapped")
+} else {
+  # Convert to matrix for heatmap
+  heatmap_matrix_balanced <- as.matrix(heatmap_data_balanced[, -1])
+  rownames(heatmap_matrix_balanced) <- heatmap_data_balanced$animal_type
+  
+  # Generate heatmap
+  # Use tryCatch to handle potential errors gracefully
+  tryCatch({
+    pheatmap(heatmap_matrix_balanced,
+             main = "Mean Concentration of Key Compounds by Animal Type (Balanced Dataset)",
+             color = colorRampPalette(c("white", "navy"))(100),
+             cluster_rows = FALSE,
+             scale = "column",  # Scale by column to highlight differences
+             display_numbers = TRUE,
+             number_format = "%.1f",
+             fontsize_number = 8)
+  }, error = function(e) {
+    warning(paste("Error generating heatmap:", e$message))
+    # If error occurs, try a simpler version without scaling or clustering
+    print("Attempting simplified heatmap...")
+    pheatmap(heatmap_matrix_balanced,
+             main = "Mean Concentration of Key Compounds (Simplified)",
+             display_numbers = TRUE,
+             number_format = "%.1f")
+  })
+}
+```
+
+## 6. Within-Animal Analysis
+
+```{r Within-animal analysis data preparation}
+# Extract all original food names to help with manual classification
+all_food_names <- metadata %>%
+  select(orig_food_id, orig_food_common_name, animal_type) %>%
+  arrange(animal_type, orig_food_common_name)
+
+# Print food names to help with creating the lookup table
+print(all_food_names)
+
+# Create template for manual meat cut lookup table
+meat_cut_lookup <- data.frame(
+  orig_food_id = metadata$orig_food_id,
+  orig_food_common_name = metadata$orig_food_common_name,
+  animal_type = metadata$animal_type,
+  meat_cut_type = NA_character_  # This column needs to be filled manually
+)
+
+# Save this template to a CSV for manual editing
+#write.csv(meat_cut_lookup, "meat_cut_lookup_template.csv", row.names = FALSE)
+
+# First, read the file as a single column of text
+raw_data <- read.csv("meat_cut_lookup_completed.csv", header = TRUE, stringsAsFactors = FALSE)
+
+# Check the column name to see what we're working with
+colnames(raw_data)
+
+# Step 1: Extract orig_food_id (first part before the comma)
+orig_food_id <- as.numeric(gsub(",.*$", "", raw_data[,1]))
+
+# Step 2: Extract meat_cut_type (last quoted part)
+meat_cut_type <- gsub(".*,\"([^\"]*)\"$", "\\1", raw_data[,1])
+
+# Create a proper data frame with these two columns
+meat_cut_lookup <- data.frame(
+  orig_food_id = orig_food_id,
+  meat_cut_type = meat_cut_type,
+  stringsAsFactors = FALSE
+)
+
+# Now join with metadata
+metadata_with_cuts <- metadata %>%
+  left_join(meat_cut_lookup, by = "orig_food_id")
+```
+## 6.2 Create Animal-Specific Datasets
+```{r create-animal-datasets}
+
+# Function to filter datasets
+filter_animal_data <- function(animal_data) {
+  # Identify metadata columns
+  metadata_cols <- c("orig_food_id", "food_id", "animal_type", "orig_food_common_name")
+  
+  # Remove compounds (columns) with all zeros
+  compound_cols <- setdiff(colnames(animal_data), metadata_cols)
+  zero_compounds <- compound_cols[colSums(animal_data[, compound_cols] == 0) == nrow(animal_data)]
+  animal_data_filtered1 <- animal_data %>% select(-all_of(zero_compounds))
+  
+  # Get updated compound columns after zero column removal
+  compound_cols_updated <- setdiff(colnames(animal_data_filtered1), metadata_cols)
+  
+  # Calculate percentage of zeros in each row across compound columns
+  zero_percentage <- rowSums(animal_data_filtered1[, compound_cols_updated] == 0) / length(compound_cols_updated)
+  
+  # Filter rows with more than 50% zeros
+  animal_data_filtered2 <- animal_data_filtered1[zero_percentage <= 0.6, ]
+  
+  # Print filtering results
+  cat("  - Removed", length(zero_compounds), "compounds with all zeros\n")
+  cat("  - Removed", nrow(animal_data_filtered1) - nrow(animal_data_filtered2), 
+      "samples with >40% zeros across compounds\n")
+  cat("  - Final sample count:", nrow(animal_data_filtered2), "\n")
+  
+  return(animal_data_filtered2)
+}
+
+# Apply filtering to each animal dataset
+cat("\nFiltering beef data:\n")
+beef_data <- filter_animal_data(beef_data_raw)
+
+cat("\nFiltering pork data:\n")
+pork_data <- filter_animal_data(pork_data_raw)
+
+cat("\nFiltering chicken data:\n")
+chicken_data <- filter_animal_data(chicken_data_raw)
+
+cat("\nFiltering mutton data:\n")
+mutton_data <- filter_animal_data(mutton_data_raw)
+```
+
+## 5. Add Meat Cut Information to Filtered Datasets
+```{r add-meat-cuts}
+# Join meat cut information to filtered datasets
+beef_data_with_cuts <- beef_data %>%
+  left_join(metadata_with_cuts %>% select(orig_food_id, meat_cut_type), by = "orig_food_id")
+
+pork_data_with_cuts <- pork_data %>%
+  left_join(metadata_with_cuts %>% select(orig_food_id, meat_cut_type), by = "orig_food_id")
+
+chicken_data_with_cuts <- chicken_data %>%
+  left_join(metadata_with_cuts %>% select(orig_food_id, meat_cut_type), by = "orig_food_id")
+
+mutton_data_with_cuts <- mutton_data %>%
+  left_join(metadata_with_cuts %>% select(orig_food_id, meat_cut_type), by = "orig_food_id")
+
+# Print meat cut distribution for beef and pork
+cat("\nBeef meat cut distribution:\n")
+beef_cut_counts <- beef_data_with_cuts %>%
+  group_by(meat_cut_type) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+print(beef_cut_counts)
+
+cat("\nPork meat cut distribution:\n")
+pork_cut_counts <- pork_data_with_cuts %>%
+  group_by(meat_cut_type) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+print(pork_cut_counts)
+```
+
+## 6. Analysis Function for Each Animal Type
+```{r analyze-function}
+analyze_animal_data <- function(animal_data_with_cuts, animal_name) {
+  # Print number of samples
+  cat(animal_name, "samples after adding meat cut info:", nrow(animal_data_with_cuts), "\n")
+  
+  # Display the distribution of samples by meat cut type
+  cut_counts <- animal_data_with_cuts %>%
+    group_by(meat_cut_type) %>%
+    summarise(count = n()) %>%
+    arrange(desc(count))
+  
+  cat("\nDistribution of", animal_name, "samples by meat cut type:\n")
+  print(cut_counts)
+  
+  # Keep all cut types regardless of sample size (no filtering)
+  animal_data_filtered <- animal_data_with_cuts %>%
+    filter(!is.na(meat_cut_type))  # Only filter out NAs in meat_cut_type
+  
+  # Remove columns that are not compound data or metadata
+  metadata_cols <- c("orig_food_id", "food_id", "animal_type", "orig_food_common_name", "meat_cut_type")
+  compound_cols <- setdiff(colnames(animal_data_filtered), metadata_cols)
+  
+  # Extract just the compound columns for compositional analysis
+  animal_comp_cols <- animal_data_filtered %>% 
+    dplyr::select(all_of(compound_cols))
+  
+  # Replace zeros with a small value
+  animal_no_zeros <- as.data.frame(animal_comp_cols)
+  for(col in colnames(animal_no_zeros)) {
+    animal_no_zeros[animal_no_zeros[,col] == 0, col] <- 1e-7
+  }
+  
+  # Convert to compositional form
+  animal_comp <- animal_no_zeros / rowSums(animal_no_zeros)
+  
+  # Add row indices for tracking
+  sample_ids <- data.frame(
+    row_index = 1:nrow(animal_data_filtered),
+    orig_food_id = animal_data_filtered$orig_food_id
+  )
+  
+  # Create compositional data object
+  animal_acomp <- acomp(animal_comp)
+  
+  # Apply CLR transformation
+  animal_clr <- compositions::clr(animal_acomp)
+  
+  # Create dataframe with CLR values and row indices
+  clr_with_index <- data.frame(
+    row_index = 1:nrow(animal_clr),
+    as.data.frame(animal_clr)
+  )
+  
+  # Join back to sample IDs
+  clr_with_ids <- clr_with_index %>%
+    left_join(sample_ids, by = "row_index")
+  
+  # Join CLR data with metadata
+  clr_with_metadata <- clr_with_ids %>%
+    left_join(animal_data_filtered %>% 
+                select(orig_food_id, meat_cut_type), 
+              by = "orig_food_id")
+  
+  # Run PCA on CLR data
+  pca_input <- clr_with_index %>% 
+    dplyr::select(-row_index)
+  
+  pca_result <- prcomp(pca_input, scale. = FALSE)
+  
+  # Calculate variance explained
+  pca_var <- summary(pca_result)$importance[2,] * 100
+  pc1_var <- round(pca_var[1], 1)
+  pc2_var <- round(pca_var[2], 1)
+  total_var <- round(pc1_var + pc2_var, 1)
+  
+  cat(animal_name, "PCA - Variance explained by PC1:", pc1_var, "%\n")
+  cat(animal_name, "PCA - Variance explained by PC2:", pc2_var, "%\n")
+  cat(animal_name, "PCA - Total variance explained (PC1+PC2):", total_var, "%\n")
+  
+  # Create dataframe with PCA scores and metadata
+  pca_scores <- data.frame(
+    row_index = 1:nrow(pca_result$x),
+    PC1 = pca_result$x[,1],
+    PC2 = pca_result$x[,2]
+  )
+  
+  pca_with_metadata <- pca_scores %>%
+    left_join(sample_ids, by = "row_index") %>%
+    left_join(animal_data_filtered %>% 
+                select(orig_food_id, meat_cut_type), 
+              by = "orig_food_id")
+  
+  # Modified: Generate PCA plot with sample counts in legend
+  # Create a named vector of sample counts for the meat cut types
+  cut_counts_vector <- cut_counts$count
+  names(cut_counts_vector) <- cut_counts$meat_cut_type
+  
+  # Modify meat cut type labels to include sample counts
+  pca_with_metadata <- pca_with_metadata %>%
+    mutate(
+      meat_cut_label = paste0(meat_cut_type, " (n=", cut_counts_vector[meat_cut_type], ")")
+    )
+  
+  # PCA Plot colored by meat cut type with sample counts in labels
+  pca_plot <- ggplot(pca_with_metadata, aes(x = PC1, y = PC2, color = meat_cut_type)) +
+    geom_point(size = 3, alpha = 0.7) +
+    # Try to create ellipses but don't error if it fails
+    tryCatch(
+      {
+        stat_ellipse(aes(group = meat_cut_type), level = 0.95)
+      },
+      error = function(e) {
+        message("Note: Could not draw confidence ellipses for all cut types due to insufficient data points.")
+      }
+    ) +
+    theme_bw() +
+    labs(title = paste(animal_name, "Compositions by Meat Cut Type"),
+         x = paste0("PC1 (", pc1_var, "%)"),
+         y = paste0("PC2 (", pc2_var, "%)"),
+         color = "Meat Cut Type") +
+    theme(legend.position = "right")
+  
+  # Alternative PCA plot with sample counts in the legend
+  pca_plot_with_counts <- ggplot(pca_with_metadata, aes(x = PC1, y = PC2, color = meat_cut_label)) +
+    geom_point(size = 3, alpha = 0.7) +
+    # Try to create ellipses but don't error if it fails
+    tryCatch(
+      {
+        stat_ellipse(aes(group = meat_cut_type), level = 0.95)
+      },
+      error = function(e) {
+        message("Note: Could not draw confidence ellipses for all cut types due to insufficient data points.")
+      }
+    ) +
+    theme_bw() +
+    labs(title = paste(animal_name, "Compositions by Meat Cut Type"),
+         x = paste0("PC1 (", pc1_var, "%)"),
+         y = paste0("PC2 (", pc2_var, "%)"),
+         color = "Meat Cut Type") +
+    theme(legend.position = "right")
+  
+  # PERMANOVA test for meat cut differences
+  if(length(unique(pca_with_metadata$meat_cut_type)) > 1) {
+    dist_matrix <- dist(pca_input)
+    permanova_result <- adonis2(dist_matrix ~ meat_cut_type, data = pca_with_metadata)
+    cat("\n", animal_name, "PERMANOVA Results:\n")
+    print(permanova_result)
+  } else {
+    cat("\n", animal_name, "only has one meat cut type, skipping PERMANOVA.\n")
+  }
+  
+  # Return the results
+  return(list(
+    pca_plot = pca_plot,
+    pca_plot_with_counts = pca_plot_with_counts,
+    pca_result = pca_result,
+    pca_with_metadata = pca_with_metadata,
+    pc1_var = pc1_var,
+    pc2_var = pc2_var,
+    total_var = total_var,
+    clr_data = animal_clr,
+    comp_data = animal_comp,
+    animal_data = animal_data_filtered,
+    cut_counts = cut_counts
+  ))
+}
+```
+
+```{r analyze-beef}
+# Analyze Beef data
+beef_results <- analyze_animal_data(beef_data_with_cuts, "Beef")
+```
+
+```{r}
+beef_data_filtered <- beef_data_with_cuts %>% 
+  filter(!(meat_cut_type %in% c("Tongue", "Neck", "Steak", "Other")))
+beef_filtered_results <- analyze_animal_data(beef_data_filtered, "Beef")
+```
+
+
+```{r analyze-pork}
+# Analyze pork data
+pork_results <- analyze_animal_data(pork_data_with_cuts, "Pork")
+```
+
+```{r}
+pork_data_filtered <- pork_data_with_cuts %>% 
+  filter(!(meat_cut_type %in% c("Ribs", "Tongue", "Neck", "Cheeck", "Flank", "Rump")))
+pork_filtered_results <- analyze_animal_data(pork_data_filtered, "Beef")
+```
+
+
+```{r analyze-chicken-mutton, eval=FALSE}
+# Analyze chicken and mutton if they have enough samples
+# Note: These may not work if there aren't enough samples per cut type
+if(nrow(chicken_data) >= 3) {
+  chicken_results <- try(analyze_animal_data(chicken_data, "Chicken"))
+}
+
+if(nrow(mutton_data) >= 3) {
+  mutton_results <- try(analyze_animal_data(mutton_data, "Mutton"))
+}
+```
+
+## 6.5 Display PCA Plots
+```{r display-pca-plots}
+# Display PCA plots
+print(beef_results$pca_plot)
+print(pork_results$pca_plot)
+print(beef_filtered_results$pca_plot)
+print(pork_filtered_results$pca_plot)
+```
+
+## 6.6 Identify Top Discriminating Compounds
+```{r top-compounds}
+# First, create a deduplicated lookup table with one name per source_id
+source_id_lookup_unique <- source_id_lookup %>%
+  group_by(source_id) %>%
+  slice(1) %>%  # Take only the first entry for each source_id
+  ungroup() %>%
+  # Select only the columns we need
+  select(source_id, orig_source_name, subklass)
+
+identify_top_compounds <- function(results, animal_name) {
+  # Calculate variance of each compound in CLR space
+  comp_variance <- apply(results$clr_data, 2, var)
+  
+  # Create a data frame with compound names and variances
+  comp_var_df <- data.frame(
+    source_id = colnames(results$comp_data),
+    variance = comp_variance
+  ) %>%
+    arrange(desc(variance))
+  
+  # Get the top 10 compounds
+  top_compounds <- head(comp_var_df, 10)
+  
+  # Ensure source_id is character type for consistent joining
+  top_compounds$source_id <- as.character(top_compounds$source_id)
+  
+  # Join with source names from the unique lookup table
+  top_compounds <- top_compounds %>%
+    left_join(source_id_lookup_unique, by = "source_id")
+  
+  cat("\nTop 10 discriminating compounds for", animal_name, "by meat cut:\n")
+  print(top_compounds)
+  
+  return(top_compounds)
+}
+
+# Identify top compounds for beef
+beef_top_compounds <- identify_top_compounds(beef_results, "Beef")
+
+# Identify top compounds for pork
+pork_top_compounds <- identify_top_compounds(pork_results, "Pork")
+
+# Uncomment for chicken and mutton if analyses were successful
+# if(exists("chicken_results") && !inherits(chicken_results, "try-error")) {
+#   chicken_top_compounds <- identify_top_compounds(chicken_results, "Chicken")
+# }
+# if(exists("mutton_results") && !inherits(mutton_results, "try-error")) {
+#   mutton_top_compounds <- identify_top_compounds(mutton_results, "Mutton")
+# }
+```
+
+## 9. Create Heatmaps of Top Compounds
+```{r create-heatmaps}
+create_compound_heatmap <- function(results, top_compounds, animal_name) {
+  # Get the animal data with cut types
+  animal_data <- results$animal_data
+  
+  # Get the top compounds source_ids
+  top_source_ids <- top_compounds$source_id
+  top_names <- top_compounds$orig_source_name
+  
+  # Create a long format dataset for the top compounds
+  compound_data <- animal_data %>%
+    select(orig_food_id, meat_cut_type, all_of(top_source_ids))
+  
+  # Calculate mean concentration by meat cut type
+  heatmap_data <- compound_data %>%
+    group_by(meat_cut_type) %>%
+    summarise(across(all_of(top_source_ids), mean, na.rm = TRUE)) %>%
+    ungroup()
+  
+  # Convert to matrix format for heatmap
+  heatmap_matrix <- as.matrix(heatmap_data %>% select(-meat_cut_type))
+  rownames(heatmap_matrix) <- heatmap_data$meat_cut_type
+  
+  # Replace the column names with more readable names if available
+  if(!is.null(top_names) && length(top_names) > 0) {
+    # Create a named vector for replacement
+    name_map <- setNames(top_names, top_source_ids)
+    # Replace any NA names with the original IDs
+    name_map[is.na(name_map)] <- names(name_map)[is.na(name_map)]
+    # Apply the mapping to column names
+    colnames(heatmap_matrix) <- name_map[colnames(heatmap_matrix)]
+  }
+  
+  # Scale the data by column (compound) for better visualization
+  heatmap_matrix_scaled <- scale(heatmap_matrix)
+  
+  # Create the heatmap
+  pheatmap(heatmap_matrix_scaled,
+           main = paste("Mean Concentration of Top Compounds by Meat Cut -", animal_name),
+           color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+           cluster_rows = FALSE,
+           cluster_cols = TRUE,
+           display_numbers = TRUE,
+           number_format = "%.1f",
+           fontsize_number = 8,
+           fontsize_row = 10,
+           fontsize_col = 8,
+           angle_col = 45)
+  
+  return(heatmap_matrix_scaled)
+}
+
+# Create heatmaps for beef and pork
+beef_heatmap <- create_compound_heatmap(beef_results, beef_top_compounds, "Beef")
+pork_heatmap <- create_compound_heatmap(pork_results, pork_top_compounds, "Pork")
+
+# Uncomment for chicken and mutton if analyses were successful
+# if(exists("chicken_results") && !inherits(chicken_results, "try-error") && exists("chicken_top_compounds")) {
+#   chicken_heatmap <- create_compound_heatmap(chicken_results, chicken_top_compounds, "Chicken")
+# }
+# if(exists("mutton_results") && !inherits(mutton_results, "try-error") && exists("mutton_top_compounds")) {
+#   mutton_heatmap <- create_compound_heatmap(mutton_results, mutton_top_compounds, "Mutton")
+# }
+```

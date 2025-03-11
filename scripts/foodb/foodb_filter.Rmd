@@ -17,6 +17,7 @@ library(ggplot2)
 library(compositions)
 library(ggrepel)
 library(broom)
+library(tibble)
 ```
 
 Data inladen
@@ -39,7 +40,7 @@ foodb_compound omzetten in dataframe voor verdere bewerkingen + aanmaken food & 
 # Stap 1: Creëer de eerste dataframe
 recepten <- foodb_compound %>%
   select(orig_food_id, source_id, converted_value) %>%
-  pivot_wider(names_from = source_id, values_from = converted_value, values_fn = list(converted_value = mean), values_fill = 0)
+  pivot_wider(names_from = source_id, values_from = converted_value, values_fn = list(converted_value = mean), values_fill = 0.00)
 
 # Stap 2: Creëer de tweede dataframe
 food_id_lookup <- foodb_compound %>%
@@ -61,6 +62,64 @@ print(source_id_lookup)
 ```
 
 Data verkenning source_ids (alle verschillende compounds), distributie over alle food_id's (~recepten) indien sample size groot/relevant genoeg is. Grens ligt momenteel op 100, handmatig gekozen om veel recepten, met weinig nulwaardes, over te houden. Echter geen volledig correcte manier van compounds verwijderen, idee: a) alle compounds met in elk recept een nulwaarde verwijderen. b) Belang compounds bepalen binnenin een food_id (diersoort). d.w.z. dat compounds die binnenin een food_id voor bijna elk recept voorkomen belangrijk zijn om te behouden, ook al is het totaal aantal nulwaarden over alle food_id's heel groot. Compounds die over elke food_id een verdeling hebben van niet nul-waarden % die onder een drempel ligt worden verwijderd.
+
+
+
+```{r}
+# Vind de source_ids waarvan alle waarden in 'recepten' nul zijn
+source_ids_all_zero <- recepten %>%
+  select(-orig_food_id) %>%  # Exclude orig_food_id kolom
+  summarise_all(~ all(. == 0)) %>%
+  pivot_longer(everything(), names_to = "source_id", values_to = "all_zeros") %>%
+  filter(all_zeros) %>%
+  pull(source_id)
+
+recepten <- recepten %>%
+  select(-all_of(source_ids_all_zero)) 
+
+# Voeg de food_id toe aan het recepten dataframe
+recepten_with_food_id <- recepten %>%
+  left_join(food_id_lookup, by = "orig_food_id")  # Voeg food_id toe
+
+# Bereken per food_id en source_id het percentage niet-nulwaarden
+source_food_distribution <- recepten_with_food_id %>%
+  select(-orig_food_id, -orig_food_common_name) %>%  # Hou alleen food_id en source_id waardes
+  pivot_longer(-food_id, names_to = "source_id", values_to = "value") %>%  # Maak lange tabel
+  group_by(food_id, source_id) %>%
+  summarise(non_zero_ratio = sum(value != 0) / n(), .groups = "drop") %>%
+  pivot_wider(names_from = food_id, values_from = non_zero_ratio, values_fill = 0)  # Maak matrix
+
+print(source_food_distribution)
+```
+
+```{r}
+source_food_distribution_TeBehouden <- source_food_distribution %>%
+  rowwise() %>%
+  filter(
+    # Voorwaarde 1: Minstens 2 van de 4 kolommen voldoen aan hun drempelwaarde
+    sum(`334` >= 0.8, `483` >= 0.8, `506` >= 0.5, `549` >= 0.5) >= 2 |
+    
+    # Voorwaarde 2: Minstens 1 kolom >= 0.8 + 2 andere kolommen moeten een niet-nulwaarde hebben
+    (max(`334`, `483`, `506`, `549`) >= 0.8 & sum(`334` != 0, `483` != 0, `506` != 0, `549` != 0) >= 3) |
+    
+    # Voorwaarde 3: Kolom 506 >= 0.53 en kolom 549 >= 0.3, of andersom
+    (`506` >= 0.53 & `549` >= 0.3) | 
+    (`549` >= 0.53 & `506` >= 0.3)
+  ) %>%
+  ungroup()
+
+print(source_food_distribution_TeBehouden)
+
+source_food_distribution_TeVerwijderen <- anti_join(
+  source_food_distribution, 
+  source_food_distribution_TeBehouden, 
+  by = "source_id"
+)
+
+print(source_food_distribution_TeVerwijderen)
+```
+
+Poging 1 filteren source_id's
 
 ```{r}
 # Bereken percentage nulwaarden per orig_food_id
@@ -125,11 +184,62 @@ print(stats_te_weinig)
 print(summary_stats)
 ```
 
+Poging 3 filteren source_id's
+
+```{r}
+# Definieer de gewenste orig_food_id's
+selected_food_ids <- c(36014, 36015, 36016, 36017, 36018, 36021, 36022, 36023)
+extra_food_ids <- c(421, 13803, 435, 13227, 13917, 23230, 372, 373, 927, 10953, 10088, 1244, 371, 1384, 13972, 5016, 928)
+
+# Combineer beide lijsten
+all_selected_food_ids <- c(selected_food_ids, extra_food_ids)
+
+# Filter en verzamel unieke source_id's
+unique_source_ids <- foodb_compound %>%
+  filter(orig_food_id %in% selected_food_ids) %>%  # Houd alleen de geselecteerde orig_food_id's
+  pull(source_id) %>%  # Haal de source_id kolom op
+  unique()  # Selecteer alleen unieke waarden
+
+unique_source_ids <- as.character(unique_source_ids)
+
+# Filter de recepten dataframe op basis van de unieke source_id's
+recepten_filtered <- recepten %>%
+  select(orig_food_id, any_of(unique_source_ids)) %>%  # Behoud enkel de kolommen in unique_source_ids
+  filter(orig_food_id %in% all_selected_food_ids) # Behoud alleen de rijen met de geselecteerde orig_food_id's
+  #select_if(~ any(. != 0))
+
+# Haal de kolomnamen op (exclusief orig_food_id)
+source_ids <- colnames(recepten_filtered)[-1]
+
+# Koppel de source_id's aan hun namen en gebruik de eerste naam voor elke source_id
+source_names <- source_id_lookup %>%
+  filter(source_id %in% source_ids) %>%  # Houd alleen de source_id's die in de kolommen staan
+  group_by(source_id) %>%  # Groepeer op source_id
+  summarise(orig_source_name = first(orig_source_name), .groups = "drop") %>%  # Neem de eerste naam
+  arrange(source_id)  # Sorteer op source_id
+
+# Print de resultante namen
+print(source_names)
+
+FOODB_MEAT <- recepten_filtered %>%
+  pivot_longer(-orig_food_id, names_to = "source_id", values_to = "value")
+
+```
+
+toevoegen recept video:
+- glutamic acid heeft enkel nulwaardes in database, vermoedelijk niet onderzocht i.p.v. een echte nulwaarde. Substituent vinden in literatuur. Tot dan heeft het toevoegen van MSG weinig zin aangezien de data niet op deze compound vergeleken kan worden.
+- idem voor suiker compounds. Volgens patenten, video en literatuur wel belangrijke rol in smaakontwikkeling, dus waarden hiervoor zijn essentieel voor een correcte gebruik van resultaten.
+- idem voor zout, is echter zoals MSG meer een smaakversterker/enhancer en draagt minder bij tot de essentie van de smaakontwikkeling.
+- 
+
 Visualizatie van het aantal recepten dat overeenkomt met het minimum aantal niet-nulwaarden %. Hulpmiddel bij evenwicht zoeken tussen genoeg recepten behouden en zo min mogelijk nulwaarden (probleem voor log-transformaties).
 
 ```{r}
 # Stap 1: Filteren van source_id's met genoeg niet-nulwaarden
-groot_genoeg_ids <- source_id_groot_genoeg$source_id  # Veronderstel dat dit de correcte bron is
+groot_genoeg_ids <- source_food_distribution_TeBehouden$source_id  # Veronderstel dat dit de correcte bron is
+
+recepten_long_full <- recepten %>%
+  pivot_longer(-orig_food_id, names_to = "source_id", values_to = "value")
 
 # Stap 2: Bereken percentage niet-nulwaarden per orig_food_id
 percentage_niet_nul <- recepten_long_full %>%
@@ -223,15 +333,15 @@ ggplot(resultaten, aes(x = n_niet_nul_drempel, y = aantal_orig_food_boven_80)) +
 Data filteren op basis van vorige resultaten voor outlier detecte en PCA. Nog eens orig_food_id filter nakijken in vscode script aangezien er nog sommige ongewenste id's doorkomen. Herbekijken na gebruik van andere source_id filtering.
 
 ```{r}
-extra_ids <- c("10005", "10102", "36014", "36015", "36016", "36017", "36018", "36019", "36020", "36021",
-               "36022", "36023", "36024", "13000", "13047", "17271", "17222", "10100", "10174", "13097",
-               "13227", "13976", "13978", "17099", "17107", "17113", "17119", "17125", "17131", "17137",
-               "17140", "17278", "23513", "13095", "13284", "13147", "13149", "13339", "17128", "17276",
-               "13838", "13841", "13844", "13847", "13859", "23623", "322", "323", "428", "13023",
-               "10072", "10121", "10187", "10219", "10228", "17110", "17142")  # Voeg hier je specifieke ID's toe
+#extra_ids <- c("10005", "10102", "36014", "36015", "36016", "36017", "36018", "36019", "36020", "36021",
+              # "36022", "36023", "36024", "13000", "13047", "17271", "17222", "10100", "10174", "13097",
+              # "13227", "13976", "13978", "17099", "17107", "17113", "17119", "17125", "17131", "17137",
+              # "17140", "17278", "23513", "13095", "13284", "13147", "13149", "13339", "17128", "17276",
+              # "13838", "13841", "13844", "13847", "13859", "23623", "322", "323", "428", "13023",
+              # "10072", "10121", "10187", "10219", "10228", "17110", "17142")  # Voeg hier je specifieke ID's toe
 
 selected_orig_food_ids <- percentage_niet_nul %>%
-  filter(percentage_niet_nul >= 79 | orig_food_id %in% extra_ids) %>%
+  filter(percentage_niet_nul >= 60) %>%
   pull(orig_food_id)  # Haal de waarden op als een vector
 
 # Stap 2: Filter recepten_long_full op deze orig_food_id's en groot_genoeg_ids
@@ -266,30 +376,15 @@ foodb_ilr <- compositions::ilr(foodb_composition)
 Mahalanobis-afstanden & PCA hebben multivariate normaliteit als voorwaarde, deze voorwaarde moet beter worden nagegaan om geloofwaardigheid resultaten in te schatten.
 
 ```{r}
-# Stap 1: Normaliteitstest uitvoeren op ILR-getransformeerde data
-foodb_ilr_df <- as.data.frame(foodb_ilr)
-
-normality_results <- foodb_ilr_df %>%
-  # Gebruik reframe() om een data frame met meerdere waarden per kolom te retourneren
-  reframe(across(everything(), ~ {
-    shapiro_test <- shapiro.test(.)  # Voer de Shapiro-test uit
-    data.frame(statistic = shapiro_test$statistic, p_value = shapiro_test$p.value)
-  })) %>%
-  pivot_longer(cols = everything(), names_to = "compound", values_to = "measure") %>%
-  unnest(cols = measure)  # Maak de data frame breed
-
-# Print resultaten
-print(normality_results)
-
 # Stap 5: Outlierdetectie met Mahalanobis-afstanden
-mahal_distances <- mahalanobis(foodb_ilr, colMeans(foodb_ilr, na.rm = TRUE), cov(foodb_ilr, use = "pairwise.complete.obs"))
-threshold <- qchisq(0.975, df = ncol(foodb_ilr))  # 97.5% grenswaarde
-outliers <- which(mahal_distances > threshold)
+#mahal_distances <- mahalanobis(foodb_ilr, colMeans(foodb_ilr, na.rm = TRUE), cov(foodb_ilr, use = "pairwise.complete.obs"))
+#threshold <- qchisq(0.975, df = ncol(foodb_ilr))  # 97.5% grenswaarde
+#outliers <- which(mahal_distances > threshold)
 
 # Lijst van outliers
-list_of_outliers <- rownames(foodb_ilr)[outliers]
-print("Outliers gevonden op basis van Mahalanobis-afstanden:")
-print(list_of_outliers)
+#list_of_outliers <- rownames(foodb_ilr)[outliers]
+#print("Outliers gevonden op basis van Mahalanobis-afstanden:")
+#print(list_of_outliers)
 
 # Stap 6: PCA uitvoeren op ILR-getransformeerde data
 pca_model <- prcomp(foodb_ilr, scale. = FALSE)

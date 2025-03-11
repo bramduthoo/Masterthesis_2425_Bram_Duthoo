@@ -1,0 +1,241 @@
+---
+title: "meatflavour"
+output: html_document
+date: "2025-02-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Packages inladen
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(compositions)
+library(ggrepel)
+library(broom)
+library(tibble)
+```
+
+Data inladen
+
+```{r}
+library(dplyr)
+foodb <- read.csv("C:\\Users\\bramd_finhsgu\\OneDrive - UGent\\Thesis\\Thesis_scripts\\Masterthesis_2425_Bram_Duthoo\\scripts\\foodb\\foodb_data.csv", header = TRUE)
+
+foodb_nutrient <- foodb %>%
+  filter(source_type == "Nutrient") %>%
+  select(-source_type)
+
+foodb_compound <- foodb %>%
+  filter(source_type == "Compound") %>%
+  select(-source_type)
+```
+
+foodb_compound omzetten in dataframe voor verdere bewerkingen + aanmaken food & source id lookup tabel voor interpretatie resultaten.
+
+```{r}
+# Stap 1: Creëer de eerste dataframe
+recepten <- foodb_compound %>%
+  select(orig_food_id, source_id, converted_value) %>%
+  pivot_wider(names_from = source_id, values_from = converted_value, values_fn = list(converted_value = mean), values_fill = 0.00)
+
+# Stap 2: Creëer de tweede dataframe
+food_id_lookup <- foodb_compound %>%
+  select(orig_food_id, food_id, orig_food_common_name) %>%
+  distinct() %>%
+  arrange(orig_food_id) %>%
+  bind_rows(tibble(orig_food_id = 36025, 
+                   food_id = 334, 
+                   orig_food_common_name = "Youtube video")) %>%
+  arrange(orig_food_id)
+
+# Stap 3: Creëer de derde dataframe
+source_id_lookup <- foodb_compound %>%
+  select(source_id, orig_source_name, subklass) %>%
+  distinct() %>%
+  arrange(source_id) %>%
+  bind_rows(tibble(source_id = c(30000, 30001), 
+                   orig_source_name = c("GMP", "IMP"), 
+                   subklass = NA)) %>%  # subklass is onbekend, dus NA
+  arrange(source_id)  # Opnieuw sorteren
+
+# Toon de dataframes
+print(recepten)
+print(food_id_lookup)
+print(source_id_lookup)
+
+```
+
+```{r}
+# Stap 1: Selecteer enkel de opgegeven source_ids en filter enkel de geselecteerde orig_food_ids
+recepten_selected <- recepten %>%
+  filter(orig_food_id %in% selected_food_ids) %>%  # Enkel geselecteerde orig_food_ids
+  select(orig_food_id, any_of(selected_source_ids))  # Behoud enkel de relevante source_id kolommen
+
+# Stap 2: Identificeer belangrijke kolommen (source_ids met minstens 1 niet-nulwaarde in de selected_food_ids)
+belangrijke_source_ids <- recepten_selected %>%
+  select(-orig_food_id) %>%  # Verwijder de identifier kolom
+  summarise_all(~ any(. != 0)) %>%  # Check of er minstens 1 niet-nulwaarde is per kolom
+  select_if(~ any(. == TRUE)) %>%  # Behoud alleen de kolommen die belangrijk zijn
+  colnames()  # Haal de namen van deze kolommen op
+
+# Stap 3: Bereken de score voor ALLE andere orig_food_ids (niet in selected_food_ids) uit recepten dataframe
+resultaat <- recepten %>%
+  filter(!(orig_food_id %in% selected_food_ids)) %>%  # Alleen nieuwe kandidaten
+  select(orig_food_id, any_of(belangrijke_source_ids)) %>%  # Behoud alleen de belangrijke source_ids
+  rowwise() %>%  # Per rij werken
+  mutate(
+    overlap_count = sum(c_across(all_of(belangrijke_source_ids)) != 0),  # Aantal niet-nulwaarden in belangrijke kolommen
+    totaal_belangrijke = length(belangrijke_source_ids),  # Totaal aantal belangrijke kolommen
+    overeenkomst_score = ifelse(totaal_belangrijke > 0, (overlap_count / totaal_belangrijke) * 100, 0)  # Score berekenen
+  ) %>%
+  ungroup() %>%
+  select(orig_food_id, overeenkomst_score) %>%  # Behoud alleen relevante kolommen
+  left_join(food_id_lookup, by = "orig_food_id") %>%  # Voeg de naam toe
+  select(orig_food_id, orig_food_common_name, overeenkomst_score) %>%  # Herorden de kolommen
+  arrange(desc(overeenkomst_score))  # Sorteer op hoogste score
+
+# Print het resultaat
+print(resultaat)
+```
+
+Om te beginnen aan de analyse is het handig om een verkennende analyse uit te voeren op een kleinere, maar representatieve datasubset.
+Aangezien er resp. slechts 3 & 5 recepten zijn voor kip en schaap, selecteren we 6 recepten voor rund en varken die morfologisch gelijkaardige achtergrond hebben + gelijkaardige data aanwezigheid qua compounds (berekend in vorige code) 
+Nadien reduceren we de recepten van rund & varken zodat deze enkel de compounds bevatten die voorkomen in de recepten van kip & schaap. Dit wordt gedaan doordat de kip & schaap recepten de limiterende factor zijn in de data, en het niet zinvol zou zijn om een vergelijking te maken tussen composities waarbij meerdere recepten geen waarden hebben voor bepaalde compounds en hiervoor een artificiële 0 zouden krijgen. Het is natuurlijk belangrijk om te onthouden welke compounds worden achtergelaten aangezien deze desondanks hun afwezigheid in metingen, wel een belangrijke rol kunnen spelen in smaakontwikkeling. Hiermee wordt later rekening gehouden zodat geen belangrijke compounds achtergelaten worden.
+
+Om deze resultaten interpreteerbaarder te maken, wordt het (kip) recept van de video toegevoegd. Om dit recept te kunnen vergelijken met de andere data wordt er opnieuw gekeken naar de compounds zodat er hiervan ook een kleinere subset gemaakt kan worden. Deze subset bevat dan alle compounds die relevant zijn voor smaakontwikkeling volgens literatuur, patenten en de video. Compounds zoals vitamine C & D worden achtergelaten aangezien er niets hierover vermeld werd in de video, en er niets terug te vinden valt in de literatuur over hun belang in smaakontwikkeling. Bovendien worden er ook compounds toegevoegd (GMP & IMP) die volgens de video, en literatuur, een belangrijke rol spelen in smaakontwikkeling. 
+
+Ten slotte wordt het recept van die video omgezet in waarden voor alle aanwezige compounds, en wordt de rest van de data, indien onverwachte nulwaardes aanwezig zijn, aangevuld met waarden van andere studies voor de relevante compounds. Op basis hiervan kan dan een log-transformatie plaatsvinden, gevolgd daar een PCA.
+
+```{r}
+# Definieer de gewenste orig_food_id's en source_id's
+selected_food_ids <- c(36014, 36015, 36016, 36017, 36018, 36021, 36022, 36023)
+extra_food_ids <- c(437, 438, 435, 417, 427, 440, 432, 373, 929, 5017, 918, 5004, 5018, 5007)
+selected_source_ids <- as.character(c(446, 465, 484, 556, 570, 1946, 2251, 2257, 2890, 2928, 2935, 2942, 2943, 2953, 
+                                       3004, 3006, 3011, 3103, 3307, 3337, 3772, 4288, 4677, 6288, 8425, 10035, 11678, 
+                                       11682, 11820, 11859, 11875, 12002, 12065, 12126, 12163, 12465, 12531, 12533, 
+                                       12566, 12636, 12686, 12742, 12881, 12890, 13900, 14708, 16140, 21947, 21973, 
+                                       21981, 24096, "30000", "30001"))  # Voeg 30000 & 30001 direct toe
+
+all_selected_food_ids <- c(selected_food_ids, extra_food_ids)
+
+# Verzamel unieke source_id's op basis van geselecteerde food_id's
+unique_source_ids <- foodb_compound %>%
+  filter(orig_food_id %in% selected_food_ids) %>%
+  pull(source_id) %>%
+  unique() %>%
+  as.character()
+
+# Filter recepten en voeg lege kolommen 30000 & 30001 toe
+recepten_filtered <- recepten %>%
+  filter(orig_food_id %in% all_selected_food_ids) %>%  # Behoud alleen de relevante rijen
+  select(orig_food_id, any_of(selected_source_ids)) %>%  # Selecteer relevante source_id's
+  mutate(`30000` = 0, `30001` = 0)
+
+# Maak een lookup-tabel voor source_id -> naam
+source_name_map <- source_id_lookup %>%
+  filter(source_id %in% colnames(recepten_filtered)[-1]) %>% 
+  group_by(source_id) %>%
+  summarise(orig_source_name = first(orig_source_name), .groups = "drop") %>%
+  arrange(source_id) %>%
+  deframe()  # Converteert naar named vector voor snelle lookup
+
+# Converteer `orig_food_id` naar namen en stel deze als rijnaam in
+recepten_filtered_named <- recepten_filtered %>%
+  left_join(food_id_lookup %>% select(orig_food_id, orig_food_common_name), by = "orig_food_id") %>%  # Voeg namen toe
+  column_to_rownames("orig_food_common_name") %>%  # Zet als rijnaam
+  select(-orig_food_id)  # Verwijder de numerieke ID
+
+# Zet source_id's om naar namen
+colnames(recepten_filtered_named) <- source_name_map[colnames(recepten_filtered_named)]
+```
+
+recept inladen: bronnen
+https://www.youtube.com/watch?v=sR8M4zARBXY&t=724s
+https://www.researchgate.net/publication/5682882_Glucagon_and_insulin_responses_after_ingestion_of_different_amounts_of_intact_and_hydrolysed_proteins
+https://www.sciencedirect.com/science/article/pii/S0733521083710180
+
+
+```{r}
+# Maak een nieuwe rij met waarden naar keuze
+nieuwe_rij <- data.frame(
+  Tyrosine = 19.91, Valine = 25.0866, Glycine = 27.6568, Alanine = 28.29935, Proline = 41.16845, Leucine = 48.2365, 
+  `(±)-Tryptophan` = 8.3622, Arginine = 47.603, `C14:0` = 0.47382136934, `C20:0` = 1.18455342336, 
+  `Nervonic acid` = 0.47382136934, `C18:0` = 9.47642738688, `C18:4, n-3` = 1.18455342336, `C18:1, n-7` = 1.18455342336, 
+  `C22:6, n-3` = 0, `Cetoleic acid` = 0.71073205401, `C12:0` = 0.23691068467, `C20:5, n-3` = 0, 
+  `Nonanoic acid` = 0, `C8:0` = 0, `C20:1, n-11` = 0.47382136934, `C22:1, n-9` = 0.71073205401, 
+  `Heptadecanoic acid` = 0.47382136934, `alpha-Linoleic acid` = 35.5366027008, Thiamin = 0.011845, `C15:0` = 0.23691068467, 
+  `C16:1, n-7` = 0.71073205401, `C16:0` = 14.2146410803, `(R)-Pantothenic acid` = 0, Histidine = 16.08185, 
+  `C20:4, n-6` = 0.23691, Threonine = 25.0685, `C4:0` = 0, `(±)-erythro-Isoleucine` = 23.8015, 
+  `Vitamin B2 (riboflavin)` = 0.00473821369, `C18:3, n-3` = 130.30087657, Fructose = 0, Glucose = 1186, 
+  Cystine = 37.84165, `C14:1, n-5` = 0, Methionine = 197.2482, Serine = 33.4488, 
+  `epsilon-Polylysine` = 42.45355, `C6:0` = 0, Phenylalanine = 31.51753, Maltodextrin = 0, 
+  `beta-Lactose` = 0, `Behenic acid` = 0, `C24:0` = 0.71073205401, `D-Aspartic acid` = 77.83, 
+  GMP = 0.592275, IMP = 0.592275, 
+  row.names = "Youtube video",
+  check.names = FALSE  # Zorgt ervoor dat speciale tekens in kolomnamen blijven
+)
+
+# Voeg de rij toe aan recepten_filtered_named
+recepten_filtered_named <- bind_rows(recepten_filtered_named, nieuwe_rij)
+
+# Bekijk het resultaat
+print(recepten_filtered_named)
+```
+
+Als epsilon = min. waarde in dataset / 10. Controleren of dit klein genoeg is, + gevoeligheidsanalyse voor epsilon waarde.
+ILR als standaard log-transformatie genomen, kan nog eens vergeleken worden met andere transformaties.
+
+
+```{r}
+# Stap 2: Vervang nullen door epsilon (klein getal om logproblemen te vermijden)
+epsilon <- 1e-7
+foodb_no_zeros <- recepten_filtered_named %>%
+  mutate(across(everything(), ~ ifelse(. == 0, epsilon, .)))
+
+# Stap 3: Normaliseren (compositiesommen moeten gelijk zijn aan 1)
+foodb_composition <- foodb_no_zeros %>%
+  mutate(across(everything(), ~ . / rowSums(foodb_no_zeros, na.rm = TRUE)))
+
+# Stap 4: ILR-transformatie uitvoeren
+foodb_ilr <- compositions::ilr(foodb_composition)
+```
+
+Mahalanobis-afstanden & PCA hebben multivariate normaliteit als voorwaarde, deze voorwaarde moet beter worden nagegaan om geloofwaardigheid resultaten in te schatten.
+
+```{r}
+# Stap 5: Outlierdetectie met Mahalanobis-afstanden
+#mahal_distances <- mahalanobis(foodb_ilr, colMeans(foodb_ilr, na.rm = TRUE), cov(foodb_ilr, use = "pairwise.complete.obs"))
+#threshold <- qchisq(0.975, df = ncol(foodb_ilr))  # 97.5% grenswaarde
+#outliers <- which(mahal_distances > threshold)
+
+# Lijst van outliers
+#list_of_outliers <- rownames(foodb_ilr)[outliers]
+#print("Outliers gevonden op basis van Mahalanobis-afstanden:")
+#print(list_of_outliers)
+
+pca_model <- prcomp(foodb_ilr, scale. = FALSE)
+
+# PCA data (voeg orig_food_id en food_id toe via een lookup op de juiste kolommen)
+pca_df <- as.data.frame(pca_model$x) %>%
+  rownames_to_column("orig_food_common_name") %>%  # Gebruik orig_food_common_name als rijnamen
+  mutate(orig_food_common_name = as.character(orig_food_common_name)) %>%  # Zorg dat het character is
+  left_join(food_id_lookup %>% mutate(orig_food_common_name = as.character(orig_food_common_name)), by = "orig_food_common_name")  # Voeg food_id toe op basis van common_name
+
+# Stap 8: PCA plotten (kleur per food_id)
+ggplot(pca_df, aes(x = PC1, y = PC2, color = as.factor(food_id), label = orig_food_common_name)) +
+  geom_point(size = 3, alpha = 0.8) +
+  geom_text_repel(size = 3) +
+  labs(title = "PCA van Meat Composition Data",
+       x = "Principal Component 1",
+       y = "Principal Component 2",
+       color = "Food ID") +
+  theme_minimal()
+
+```
+
+Food ID 334 = kip, 483 = schaap, 506 = rund, 549 = varken.
