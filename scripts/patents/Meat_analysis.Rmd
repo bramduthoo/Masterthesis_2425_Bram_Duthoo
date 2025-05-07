@@ -21,6 +21,7 @@ library(DBI)
 library(RSQLite)
 library(stats)
 library(tidyverse)
+library(robCompositions)
 library(compositions) 
 library(rlang)
 library(MASS)       
@@ -28,6 +29,7 @@ library(ggplot2)
 library(ggfortify)   
 library(dplyr)
 library(tidyr) 
+library(zCompositions)
 ```
 
 De database die hier gebruikt wordt is opgebouwd door in patenten (met als onderwerp 'synthetiseren van artificiële vleessmaken') op zoek te gaan voorbeeldrecepten die een bepaalde vleessmaak nabootsen. Als alle recepten voorgesteld zouden worden als een compositie van alle ingrediënten zullen er later problemen ontstaan tijdens de analyse aangezien het aantal parts te groot is: 71. Hierdoor worden alle ingrediënten samengevat door hun chemische groepen zoals suikers, aminozuren, ribonucleotides, etc. en worden recepten gezien als een compositie hiervan. Deze beslissing wordt ook gemotiveerd door de informatie in de patenten aangezien in de beschrijving van de synthetische vleessmaak enkel over chemische groepen wordt gesproken, en enkel in recepten specifieke ingrediënten worden gebruikt. Vaak zijn deze ingrediënten dan ook de meest economische optie binnenin de categorie, en verliest het veralgemenen van ingrediënten naar chemische groepen geen relevante informatie voor het synthetiseren van vleessmaken.
@@ -65,7 +67,7 @@ print(head(data_grouped))
 De aanwezigheid van nullen in compositionele data is een probleem aangezien het niet compatibel is met log-ratio transformaties. In compositionele data worden er 2 soorten nullen onderscheiden: rounded zeroes & structural zeroes. Rounded zeroes zijn de nullen die door meetfouten of processfouten niet zijn opgenomen of verwerkt, maar er wordt wel een waarde verwacht, structural zeroes zijn dan de nullen die effectief een nul representeren. Er bestaan verschillende manieren om om te gaan met rounded zeroes zoals imputatie, KNN, Bayesian-multiplicative replacement strategy, etc. aangezien er een waarde verwacht wordt en de nul vervangen kan worden. Voor structural zeroes gaat dit helaas niet zo makkelijk aangezien de 0 verwacht wordt en betekenis heeft. Tot op heden zijn er nog geen algemeen aanvaarde manieren om te kunnen omgaan met structurele nullen.
 
 *De nullen in onze data zijn structurele nullen door de aard van recepten, een afwezigheid van een component betekent ook effectief dat deze component afwezig hoort te zijn. Doordat er dus nog geen manieren zijn om hiermee om te gaan wordt er vaak voorgesteld in papers om een methode voor rounded zeroes toe te passen die aansluit bij de data en onderzoeksvraag. In dit geval lijkt imputatie (vervangen van 0 met een kleine waarde) me geschikt, sinds de definitie van structurele nullen me niet lijkt over te slaan naar smaakperceptie. Er bestaan smaaktresholds en "merkbare verschillen", wat gebruikt zou kunnen worden als excuus voor het toelaten van een heel kleine waarde.*
-*Verschillende imputatie modellen testen en vergelijken via procrustes correlaties en gevoeligheidsanalyses, potentieel andere methodes zoeken/ontwikkelen die passen in de context van smaak*
+Gevoeligheidsanalyse van 1e-3 tot 1e-7 geeft weinig verandering in PCA plot en verandert structuur van data dus niet veel. Gebruik van 1e-4 is dus verantwoord.
 
 ```{r nullen inspecteren}
 excluded_columns <- c("recipe_name", "cooking_time", "temperature", "preparation", "flavor_label")
@@ -79,10 +81,10 @@ result_table <- data.frame(
 print(result_table)
 ```
 
+
 Het is beter bij methodes zoals imputatie om het aantal nullen te vervangen te minimaliseren zodat de data zo min mogelijk wordt verstoord. Hiervoor is het relevant om te kijken naar de aanwezigheid van nullen in de data.
 Zoals af te lezen is van de tabel, bevat de data heel veel nullen. De parts smaakenhancer, zuren, extra en volatiles bestaan uit minstens 50% nullen en worden in de patenten beschreven als aanvullend en niet-essentieel/betrokken in de synthese van de vleessmaak en zouden gefilterd kunnen worden van de dataset om het nulprobleem gedeeltelijk op te lossen en enkel te focussen op relevante data voor vleessmaak.
-Daarnaast zijn er 
-*Voordat deze parts worden gefilterd of samengevoegd, nog eens het effect hiervan bekijken met supervised logratio variable selection dat ons toelaat te quantificeren hoeveel variantie we zouden verliezen tov de gehele dataset. Gebruiken als backup voor statement dat deze categoriën toch niet veel bijdragen.*
+
 
 ## Outlier detectie
 
@@ -95,44 +97,63 @@ Mahalanobis-afstanden is de standaard om outliers te detecteren in compositionel
 *normaliteit 
 
 ```{r outliers detecteren}
+# Stap 1: Verwijder niet-inhoudelijke kolommen
 data_preprocessed <- data_grouped %>%
-  dplyr::select(-c(recipe_name, cooking_time, temperature, flavor_label, preparation)) %>%
-  mutate(Carrier = Water + Vetten) %>%  
-  dplyr::select(-c(Water, Vetten, Zuren, extra, Volatiles, Smaakenhancer))
+  dplyr::select(-c(recipe_name, cooking_time, temperature, flavor_label, preparation, Zuren, extra, Volatiles, Smaakenhancer))
 
-epsilon <- 1e-3
-data_no_zeros <- data_preprocessed %>%
-  mutate(across(everything(), ~ ifelse(. == 0, epsilon, .)))
+# Stap 2: Imputeer nullen via multiplicative replacement
+library(robCompositions)
+data_imputed <- cmultRepl(data_preprocessed, label = 0, method = "CZM", output = "prop")
 
-data_normalized <- data_no_zeros %>%
-  mutate(across(everything(), ~ . / rowSums(data_no_zeros, na.rm = TRUE)))
+# Stap 3: Zet om naar compositieformaat
+library(compositions)
+comp_data <- acomp(data_imputed)
 
-data_ilr <- data_normalized %>%
-  compositions::ilr()
-
-mahal_distances <- mahalanobis(data_ilr, colMeans(data_ilr, na.rm = TRUE), cov(data_ilr, use = "pairwise.complete.obs"))
-threshold <- qchisq(0.975, df = ncol(data_ilr))  
-outliers <- which(mahal_distances > threshold)  
-
-list_of_outliers <- outliers
-print("Outliers gevonden op basis van Mahalanobis-afstanden:")
-print(list_of_outliers)
-
+# Stap 4a: ILR distributies plotten
+data_ilr <- ilr(comp_data)
 ilr_df <- as.data.frame(data_ilr)
 for (i in seq_along(ilr_df)) {
   col_name <- colnames(ilr_df)[i]  
-  plot <- ggplot(ilr_df, aes(x = !!sym(col_name))) +
+  plot <- ggplot(ilr_df, aes_string(x = col_name)) +
     geom_histogram(bins = 30, fill = "blue", alpha = 0.7) +
     labs(title = paste("Histogram van ILR-component:", col_name)) +
     theme_minimal()
   print(plot)
 }
+
+# Stap 4b: Outlierdetectie via robuuste methode
+outlier_result <- outCoDa(comp_data)
+outlier_flags <- outlier_result$flag
+print(outlier_flags)
 ```
+
 *Mahalanobis afstanden vereist multivariate normaliteit, potentieel betere alternatieven vinden. Imputaties hebben wel een grote invloed, extra bevestiging dat gevoeligheidstest nulvervanging vereist is.*
 
 extra: Verdelingen hebben gelijkaardig bereik, geen nood aan gewichten dus.
 
 # Data analyse
+```{r PCA}
+# Stap 1: PCA uitvoeren
+clr_data <- clr(comp_data)
+pca_result <- prcomp(clr_data, center = TRUE, scale. = FALSE)
+summary(pca_result)
+
+# Voeg smaaklabels toe
+clr_df <- as.data.frame(clr_data)
+clr_df$flavor_label <- data_grouped$flavor_label  # Voeg labels toe
+
+# PCA uitvoeren
+pca_result <- prcomp(clr_df %>% dplyr::select(-flavor_label), center = TRUE, scale. = FALSE)
+
+# PCA-plot maken met kleur per smaak
+library(ggplot2)
+library(ggfortify)
+
+autoplot(pca_result, data = clr_df, colour = "flavor_label", loadings.label.size = 3) +
+  ggtitle("PCA (CLR-transformed data with multiplicative zero replacement)") +
+  theme_minimal()
+```
+
 
 Om de onderzoeksvraag te kunnen beantwoorden 
 -LRA: PCA analysis op log ratio's. visualizatie clusters tussen verschillende vleessmaken, loadings interpreteren, 
