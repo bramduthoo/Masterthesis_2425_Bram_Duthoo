@@ -15,16 +15,17 @@ Deze sectie heeft als doel de compositionele data voor te bereiden voor log-rati
 ## Data inladen
 
 Alle nodige packages worden hier ingeladen.
+```{r}
+setwd("C:/Users/bramd_finhsgu/OneDrive - UGent/Thesis/Thesis_scripts/Masterthesis_2425_Bram_Duthoo/scripts/patents")
+renv::init(bare = TRUE)
+```
+
 
 ```{r libraries inladen}
 library(DBI)
 library(RSQLite)
-library(stats)
-library(tidyverse)
 library(robCompositions)
 library(compositions) 
-library(rlang)
-library(MASS)       
 library(ggplot2)
 library(ggfortify)   
 library(dplyr)
@@ -32,11 +33,17 @@ library(tidyr)
 library(zCompositions)
 ```
 
+```{r}
+renv::activate()
+renv::snapshot()
+```
+
+
 De database die hier gebruikt wordt is opgebouwd door in patenten (met als onderwerp 'synthetiseren van artificiële vleessmaken') op zoek te gaan voorbeeldrecepten die een bepaalde vleessmaak nabootsen. Als alle recepten voorgesteld zouden worden als een compositie van alle ingrediënten zullen er later problemen ontstaan tijdens de analyse aangezien het aantal parts te groot is: 71. Hierdoor worden alle ingrediënten samengevat door hun chemische groepen zoals suikers, aminozuren, ribonucleotides, etc. en worden recepten gezien als een compositie hiervan. Deze beslissing wordt ook gemotiveerd door de informatie in de patenten aangezien in de beschrijving van de synthetische vleessmaak enkel over chemische groepen wordt gesproken, en enkel in recepten specifieke ingrediënten worden gebruikt. Vaak zijn deze ingrediënten dan ook de meest economische optie binnenin de categorie, en verliest het veralgemenen van ingrediënten naar chemische groepen geen relevante informatie voor het synthetiseren van vleessmaken.
 
 ```{r database inladen}
 db <- dbConnect(RSQLite::SQLite(), 
-                "C:/Users/bramd_finhsgu/OneDrive - UGent/Thesis/Thesis_bestanden/recipes9.db")
+                "data/patents/recipes9.db")
 
 recipes            <- dbReadTable(db, "recipes")
 chemical_groups    <- dbReadTable(db, "chemical_groups")
@@ -67,7 +74,6 @@ print(head(data_grouped))
 De aanwezigheid van nullen in compositionele data is een probleem aangezien het niet compatibel is met log-ratio transformaties. In compositionele data worden er 2 soorten nullen onderscheiden: rounded zeroes & structural zeroes. Rounded zeroes zijn de nullen die door meetfouten of processfouten niet zijn opgenomen of verwerkt, maar er wordt wel een waarde verwacht, structural zeroes zijn dan de nullen die effectief een nul representeren. Er bestaan verschillende manieren om om te gaan met rounded zeroes zoals imputatie, KNN, Bayesian-multiplicative replacement strategy, etc. aangezien er een waarde verwacht wordt en de nul vervangen kan worden. Voor structural zeroes gaat dit helaas niet zo makkelijk aangezien de 0 verwacht wordt en betekenis heeft. Tot op heden zijn er nog geen algemeen aanvaarde manieren om te kunnen omgaan met structurele nullen.
 
 *De nullen in onze data zijn structurele nullen door de aard van recepten, een afwezigheid van een component betekent ook effectief dat deze component afwezig hoort te zijn. Doordat er dus nog geen manieren zijn om hiermee om te gaan wordt er vaak voorgesteld in papers om een methode voor rounded zeroes toe te passen die aansluit bij de data en onderzoeksvraag. In dit geval lijkt imputatie (vervangen van 0 met een kleine waarde) me geschikt, sinds de definitie van structurele nullen me niet lijkt over te slaan naar smaakperceptie. Er bestaan smaaktresholds en "merkbare verschillen", wat gebruikt zou kunnen worden als excuus voor het toelaten van een heel kleine waarde.*
-Gevoeligheidsanalyse van 1e-3 tot 1e-7 geeft weinig verandering in PCA plot en verandert structuur van data dus niet veel. Gebruik van 1e-4 is dus verantwoord.
 
 ```{r nullen inspecteren}
 excluded_columns <- c("recipe_name", "cooking_time", "temperature", "preparation", "flavor_label")
@@ -88,13 +94,8 @@ Zoals af te lezen is van de tabel, bevat de data heel veel nullen. De parts smaa
 
 ## Outlier detectie
 
-Outlier detectie voor compositionele data met strcuturele nullen:
-Templ, M., Hron, K., & Filzmoser, P. (2016). Exploratory tools for outlier detection in compositional data with structural zeros. Journal of Applied Statistics, 44(4), 734–752. https://doi.org/10.1080/02664763.2016.1182135
-*Nog geen functies hiervoor, voor deze workflow te integreren in een functie -> nadenken of deze detectie wel geschikt is als de nulwaarden toch geïmputeerd zullen worden. Het klinkt veelbelovend, maar potentieel overbodig als de nullen toch geïmputeerd worden.*
-
 Indien we verder werken met de imputaties en gefilterde dataset:
-Mahalanobis-afstanden is de standaard om outliers te detecteren in compositionele data 
-*normaliteit 
+Mahalanobis-afstanden is de standaard om outliers te detecteren in compositionele data. vereist echter multivariate normaliteit. Niet echt het geval, eerder werken met een robuuste methode.
 
 ```{r outliers detecteren}
 # Stap 1: Verwijder niet-inhoudelijke kolommen
@@ -102,11 +103,9 @@ data_preprocessed <- data_grouped %>%
   dplyr::select(-c(recipe_name, cooking_time, temperature, flavor_label, preparation, Zuren, extra, Volatiles, Smaakenhancer))
 
 # Stap 2: Imputeer nullen via multiplicative replacement
-library(robCompositions)
 data_imputed <- cmultRepl(data_preprocessed, label = 0, method = "CZM", output = "prop")
 
 # Stap 3: Zet om naar compositieformaat
-library(compositions)
 comp_data <- acomp(data_imputed)
 
 # Stap 4a: ILR distributies plotten
@@ -127,40 +126,42 @@ outlier_flags <- outlier_result$flag
 print(outlier_flags)
 ```
 
-*Mahalanobis afstanden vereist multivariate normaliteit, potentieel betere alternatieven vinden. Imputaties hebben wel een grote invloed, extra bevestiging dat gevoeligheidstest nulvervanging vereist is.*
-
-extra: Verdelingen hebben gelijkaardig bereik, geen nood aan gewichten dus.
 
 # Data analyse
 ```{r PCA}
 # Stap 1: PCA uitvoeren
-clr_data <- clr(comp_data)
-pca_result <- prcomp(clr_data, center = TRUE, scale. = FALSE)
+ilr_data <- ilr(comp_data)
+pca_result <- prcomp(ilr_data, center = TRUE, scale. = FALSE)
 summary(pca_result)
 
 # Voeg smaaklabels toe
-clr_df <- as.data.frame(clr_data)
-clr_df$flavor_label <- data_grouped$flavor_label  # Voeg labels toe
+ilr_df <- as.data.frame(ilr_data)
+ilr_df$flavor_label <- data_grouped$flavor_label  # Voeg labels toe
 
 # PCA uitvoeren
-pca_result <- prcomp(clr_df %>% dplyr::select(-flavor_label), center = TRUE, scale. = FALSE)
+pca_result <- prcomp(ilr_df %>% dplyr::select(-flavor_label), center = TRUE, scale. = FALSE)
 
-# PCA-plot maken met kleur per smaak
-library(ggplot2)
-library(ggfortify)
+p <- autoplot(pca_result, 
+         data = ilr_df, 
+         colour = "flavor_label", 
+         size = 3) +
+  scale_color_brewer(palette = "Set1", name = NULL) +  # Geen titel boven legende
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "bottom",                      # Legende onderaan
+    legend.direction = "horizontal",                 # Horizontale oriëntatie
+    legend.box = "horizontal",                       # Zorgt dat titel en inhoud netjes staan
+    legend.title = element_blank(),                  # Titel weglaten
+    legend.text = element_text(size = 11),           # Iets kleiner voor compactheid
+    legend.key.size = unit(0.4, "cm"),               # Compactere vakjes
+    plot.title = element_text(size = 16, hjust = 0.5),
+    axis.title = element_text(size = 13),
+    axis.text = element_text(size = 12)
+  )
 
-autoplot(pca_result, data = clr_df, colour = "flavor_label", loadings.label.size = 3) +
-  ggtitle("PCA (CLR-transformed data with multiplicative zero replacement)") +
-  theme_minimal()
+ggsave(filename = "C:/Users/bramd_finhsgu/OneDrive - UGent/Thesis/afbeeldingen/PCA_plot_thesis.png",
+       plot = p, width = 8, height = 5, dpi = 300)
 ```
 
 
-Om de onderzoeksvraag te kunnen beantwoorden 
--LRA: PCA analysis op log ratio's. visualizatie clusters tussen verschillende vleessmaken, loadings interpreteren, 
--(Ward) Cluster analysis: visualizatie, maar meer gefocust op welke groepen chemisch op mekaar lijken
-- Supervised logratio variable selection: Selecteert logratio’s die zowel de variabiliteit in de data verklaren als de smaaklabels goed onderscheiden
-- regressiemodellen: belangrijkste logratio's uit vorige stap gebruiken. Initieel LDA, dan SVM of RF proberen. Ook eens vleessmaak label als verklarende variabele om te zien hoeveel variatie dit in de compositie bevat
-
-extra: 
-1. onderzoeken of clusters in pca niet gewoon de variatie tussen patenten weerspiegelt of echt patronen in vleessmaak vastlegt. Potentieel compositiesubsets maken per patent en log/ratio variaties hierin vergelijken met die van de gehele dataset?
-2. gevoeligheidsanalyse, omdat de smaaklabels uit patenten komen en mogelijk inconsistent zijn. Clustering op een unsupervised methode checken voor outliers.
+geen clustering.
