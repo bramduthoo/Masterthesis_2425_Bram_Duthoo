@@ -1,0 +1,1529 @@
+---
+title: "official_foodb_analysis"
+author: "Bram Duthoo"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: united
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 10, fig.height = 7)
+```
+
+## 1. Introduction and Data Loading
+
+This document analyzes meat flavor composition data across different animal types and meat cuts using compositional data analysis methods.
+
+```{r load-libraries}
+# Load required libraries
+library(compositions)
+library(zCompositions)
+library(robCompositions)
+library(ggplot2)
+library(ggrepel)
+library(factoextra)
+library(vegan)
+library(tidyverse)
+library(pheatmap)
+library(RColorBrewer)
+library(gridExtra)
+library(readr)
+library(stringr)
+library(caret)
+library(MASS)
+library(dplyr)
+```
+
+### 1.1 Load Data
+```{r load-data}
+# Load the main datasets
+foodb <- read.csv("data/foodb_analyse/foodb_data.csv", header = TRUE)
+foodb_nutrient <- foodb %>%
+  filter(source_type == "Nutrient") %>%
+  dplyr::select(-source_type)
+foodb_compound <- foodb %>%
+  filter(source_type == "Compound") %>%
+  dplyr::select(-source_type)
+
+# Create the main data objects
+recepten <- foodb_compound %>%
+  dplyr::select(orig_food_id, source_id, converted_value) %>%
+  pivot_wider(names_from = source_id, values_from = converted_value, values_fn = list(converted_value = mean), values_fill = 0.00)
+
+# Create lookup tables
+food_id_lookup <- foodb_compound %>%
+  dplyr::select(orig_food_id, food_id, orig_food_common_name) %>%
+  arrange(orig_food_id) %>%
+  distinct(orig_food_id, .keep_all = TRUE)
+
+source_id_lookup <- foodb_compound %>%
+  dplyr::select(source_id, orig_source_name, subklass) %>%
+  distinct() %>%
+  arrange(source_id)
+
+source_id_lookup_fixed <- source_id_lookup %>%
+  mutate(source_id = as.character(source_id))
+```
+
+### 1.2 Create Metadata
+
+```{r create-metadata}
+# Join lookup information to the main dataframe
+recepten_with_info <- recepten %>%
+  left_join(food_id_lookup, by = "orig_food_id")
+
+# Create an animal type column based on food_id
+recepten_with_info <- recepten_with_info %>%
+  mutate(animal_type = case_when(
+    food_id == 506 ~ "beef",
+    food_id == 549 ~ "pork",
+    food_id == 334 ~ "chicken",
+    food_id == 483 ~ "mutton",
+    TRUE ~ "unknown"
+  ))
+
+# Extract metadata for later use
+metadata <- recepten_with_info %>%
+  dplyr::select(orig_food_id, food_id, animal_type, orig_food_common_name)
+
+# Summary of data by animal type
+animal_summary <- metadata %>%
+  group_by(animal_type) %>%
+  summarise(count = n()) %>%
+  arrange(desc(count))
+
+# First, read the file as a single column of text
+raw_data <- read.csv("data/foodb_analyse/meat_cut_lookup_completed.csv", header = TRUE, stringsAsFactors = FALSE) 
+
+# Step 1: Extract orig_food_id (first part before the comma)
+orig_food_id <- as.numeric(gsub(",.*$", "", raw_data[,1]))
+
+# Step 2: Extract meat_cut_type (last quoted part)
+meat_cut_type <- gsub(".*,\"([^\"]*)\"$", "\\1", raw_data[,1])
+
+# Create a proper data frame with these two columns
+meat_cut_lookup <- data.frame(
+  orig_food_id = orig_food_id,
+  meat_cut_type = meat_cut_type,
+  stringsAsFactors = FALSE
+)
+
+# Now join with metadata
+metadata_with_cuts <- metadata %>%
+  left_join(meat_cut_lookup, by = "orig_food_id")
+```
+
+### 1.3 Data objecten voorbereiden
+
+```{r}
+#1. Verwijderen van kolommen die enkel nulwaarden hebben. Zorgt ervoor dat het aantal variabelen wat vermindert aangezien er initieel 127 compounds zijn. Bovendien draagt dit minder bij aan het vergelijken tussen samples als het voor elk sample toch 0 is.
+compound_cols <- setdiff(names(recepten), "orig_food_id")
+zero_compounds <- compound_cols[colSums(recepten[, compound_cols] == 0) == nrow(recepten)]
+
+# Koppel deze via lookup aan namen
+removed_zero_compound_info <- source_id_lookup %>%
+  filter(source_id %in% zero_compounds) %>%
+  arrange(source_id)
+
+# Toon verwijderde compounds met naam
+cat("Aantal verwijderde compounds (alle waarden = 0):", nrow(removed_zero_compound_info), "\\n")
+print(removed_zero_compound_info)
+
+# Filter de data
+recepten_filtered <- recepten %>% dplyr::select(-any_of(zero_compounds))
+
+#2. Imputeren van nulwaarden via CZM.
+recepten_matrix <- as.matrix(recepten_filtered %>% dplyr::select(-orig_food_id))
+
+total_values <- length(recepten_matrix)
+
+# Aantal nulwaarden
+zero_values <- sum(recepten_matrix == 0)
+
+# Percentage nulwaarden
+percentage_zero <- zero_values / total_values * 100
+
+# Resultaat tonen
+cat("Totaal aantal waarden:", total_values, "\n")
+cat("Aantal nulwaarden:", zero_values, "\n")
+cat("Percentage nulwaarden:", round(percentage_zero, 2), "%\n")
+
+# Imputatie zonder kolomverwijdering
+recepten_czm <- cmultRepl(recepten_matrix, method = "CZM", output = "prop",
+                          label = 0, z.warning = FALSE, z.delete = FALSE)
+
+#3. Compositionele objecten aanmaken.
+recepten_acomp <- acomp(recepten_czm)
+
+# ILR en CLR transformatie uitvoeren
+recepten_ilr <- ilr(recepten_acomp)
+recepten_clr <- clr(recepten_acomp)
+
+# Voeg orig_food_id toe aan ILR-resultaat voor traceerbaarheid
+recepten_ilr_df <- as.data.frame(recepten_ilr)
+recepten_ilr_df$orig_food_id <- recepten_filtered$orig_food_id
+
+# Bewaar ook CLR-resultaat indien nodig voor PCA
+recepten_clr_df <- as.data.frame(recepten_clr)
+recepten_clr_df$orig_food_id <- recepten_filtered$orig_food_id
+```
+
+###1.4 Outlier detectie
+
+eerst controleren op multivariate normaliteit om te zien welke methodes toegepast kunnen worden voor outlier detectie
+```{r}
+# Pas shapiro.test() toe op elke ILR-component in recepten_ilr_df
+shapiro_results <- apply(recepten_ilr_df[, -which(names(recepten_ilr_df) == "orig_food_id")], 2, function(x) {
+  if (length(unique(x)) >= 3) {
+    tryCatch(shapiro.test(x)$p.value, error = function(e) NA)
+  } else {
+    NA
+  }
+})
+
+# Combineer in dataframe
+shapiro_df <- data.frame(
+  ILR_component = names(shapiro_results),
+  p_value = unlist(shapiro_results)
+) %>%
+  mutate(normal = ifelse(p_value > 0.05, "Yes", "No")) %>%
+  arrange(p_value)
+
+# Resultaat bekijken
+print(shapiro_df)
+
+# Samenvatting
+cat("Aantal ILR-componenten met p > 0.05 (normaal):", sum(shapiro_df$normal == "Yes", na.rm = TRUE), "\\n")
+cat("Aantal ILR-componenten met p <= 0.05 (niet normaal):", sum(shapiro_df$normal == "No", na.rm = TRUE), "\\n")
+
+```
+
+geen normaliteit -> robuuste methode
+
+```{r}
+# Pas outCoDa toe op het acomp-object
+outlier_result <- outCoDa(recepten_acomp)
+
+# Voeg de outlier-score toe aan het dataframe met IDs
+outlier_flags <- outlier_result$outliers
+outlier_df <- data.frame(
+  orig_food_id = recepten_filtered$orig_food_id,
+  outlier = outlier_flags
+)
+
+# Voeg lookup-informatie toe
+outlier_info <- outlier_df %>%
+  filter(outlier == TRUE) %>%
+  left_join(metadata_with_cuts, by = "orig_food_id") %>%
+  select(orig_food_id, orig_food_common_name, meat_cut_type, animal_type)
+
+# Toon resultaten
+cat("Aantal gedetecteerde outliers:", nrow(outlier_info), "\\n")
+print(outlier_info)
+
+```
+
+Teveel variabelen voor de outlier detectie te kunnen uitvoeren. Outliers zullen visueel op PCA worden opgemerkt.
+
+###1.5 PCA
+
+```{r}
+# Exclude ID voor PCA
+ilr_matrix <- recepten_ilr_df %>% dplyr::select(-orig_food_id)
+dist_matrix <- dist(ilr_matrix)
+adonis2(dist_matrix ~ animal_type, data = metadata_with_cuts)
+
+# PCA uitvoeren
+pca_result <- prcomp(ilr_matrix, center = TRUE, scale. = FALSE)
+
+# Combineer met metadata
+pca_scores <- as.data.frame(pca_result$x) %>%
+  mutate(orig_food_id = recepten_ilr_df$orig_food_id) %>%
+  left_join(metadata_with_cuts, by = "orig_food_id")
+
+
+# Plot
+pca_scores$animal_type <- factor(pca_scores$animal_type, 
+                                 levels = c("beef", "pork", "chicken", "mutton"))
+
+p <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = animal_type)) +
+  geom_point(size = 3, alpha = 0.9) +
+  scale_color_manual(
+    values = c("beef" = "#E41A1C",   # rood
+               "pork" = "#FF7F00",   # oranje
+               "chicken" = "#377EB8",# blauw
+               "mutton" = "#984EA3"), # paars
+    name = NULL
+  ) +
+  labs(
+    x = paste0("PC1 (", round(100 * summary(pca_result)$importance[2, 1], 1), "%)"),
+    y = paste0("PC2 (", round(100 * summary(pca_result)$importance[2, 2], 1), "%)")
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.box = "horizontal",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 11),
+    legend.key.size = unit(0.4, "cm"),
+    plot.title = element_blank(),
+    axis.title = element_text(size = 13),
+    axis.text = element_text(size = 12)
+  )
+
+# Plot tonen
+print(p)
+
+#scree plot
+fviz_eig(pca_result, ncp = 10, addlabels = TRUE, barfill = "steelblue", linecolor = "red")
+scree_plot <- fviz_eig(
+  pca_result,
+  ncp = 10,
+  addlabels = TRUE,
+  barfill = "grey50",
+  barcolor = "grey30",
+  linecolor = "black",
+  pointsize = 2.5
+) +
+  labs(
+    x = "Principal components",
+    y = "Percentage of explained variance"
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    axis.title = element_text(size = 13),
+    axis.text = element_text(size = 12),
+    plot.title = element_blank()
+  )
+
+
+# Indien gewenst: opslaan
+ggsave("C:/Users/bramd_finhsgu/OneDrive - UGent/Thesis/afbeeldingen/PCA_fooDBstart.png",
+       plot = p, width = 8, height = 5, dpi = 300)
+ggsave("C:/Users/bramd_finhsgu/OneDrive - UGent/Thesis/afbeeldingen/scree_plot.png",
+       plot = scree_plot, width = 8, height = 6, dpi = 300)
+
+```
+
+Clustering van chicken and mutton, maar kan ook gevolg zijn van weinig samples. beef en pork clusteren niet en overlappen zelf veel. Dit kan het gevolg zijn van teveel variabelen (99), screeplot bevestigd dat slechts een klein deel van de principal components de variatie verklaart. Dit zal verder onderzocht moeten worden door een subset van compounds te selecteren.
+Bovendien vallen er geen outliers op.
+Hieronder wordt binnenin rund en varken onderzocht waarom er meerdere clusters per dier zijn a.d.h.v. metadata over het type cut.
+
+```{r}
+# --- Filter rund of varken ---
+diergroep <- "beef"  # kies "beef" of "pork"
+
+# Filter metadata en CLR-data
+meta_subset <- metadata_with_cuts %>%
+  filter(animal_type == diergroep)
+
+ilr_subset <- recepten_ilr_df %>%
+  filter(orig_food_id %in% meta_subset$orig_food_id)
+
+# PCA uitvoeren (exclusief ID)
+ilr_matrix <- ilr_subset %>% select(-orig_food_id)
+pca_result <- prcomp(ilr_matrix, center = TRUE, scale. = FALSE)
+
+# Combineer PCA scores met metadata
+pca_scores <- as.data.frame(pca_result$x) %>%
+  mutate(orig_food_id = ilr_subset$orig_food_id) %>%
+  left_join(meta_subset, by = "orig_food_id")
+
+# Plot maken met meat cut type als kleur
+ggplot(pca_scores, aes(x = PC1, y = PC2, color = meat_cut_type)) +
+  geom_point(size = 3, alpha = 0.7) +
+  ggrepel::geom_text_repel(aes(label = orig_food_common_name),
+                           size = 2.5, max.overlaps = 20, box.padding = 0.4) +
+  theme_classic(base_size = 14) +
+  labs(
+    title = paste("PCA van", diergroep, "samples op basis van meat_cut_type"),
+    x = paste0("PC1 (", round(100 * summary(pca_result)$importance[2,1], 1), "%)"),
+    y = paste0("PC2 (", round(100 * summary(pca_result)$importance[2,2], 1), "%)"),
+    color = "Meat cut"
+  ) +
+  theme(
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11),
+    axis.title = element_text(size = 13),
+    axis.text = element_text(size = 11)
+  )
+
+
+p <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = meat_cut_type)) +
+  geom_point(size = 3, alpha = 0.8) +
+  theme_classic(base_size = 14) +
+  labs(
+    x = paste0("PC1 (", round(100 * summary(pca_result)$importance[2,1], 1), "%)"),
+    y = paste0("PC2 (", round(100 * summary(pca_result)$importance[2,2], 1), "%)"),
+    color = "Meat cut"
+  ) +
+  guides(color = guide_legend(nrow = NULL, ncol = 1)) +  # 1 kolom, nrow op NULL
+  theme(
+    legend.position = "right",       # rechts van de plot
+    legend.direction = "vertical",   # items onder elkaar
+    legend.title = element_blank(),
+    legend.text = element_text(size = 12),
+    legend.key.size = unit(0.6, "cm"),  # iets groter voor betere leesbaarheid
+    plot.title = element_blank(),
+    axis.title = element_text(size = 13),
+    axis.text = element_text(size = 12)
+  )
+
+print(p)
+ggsave("C:/Users/bramd_finhsgu/OneDrive - UGent/Thesis/afbeeldingen/PCA_beef1.png",
+       plot = p, width = 8, height = 5, dpi = 300)
+```
+
+Er is geen clustering volgens de vleescut.
+
+##2. Subset analyse
+
+Hierbij gaan we een subset aanmaken op basis van relevante compounds beschreven in de literatuur.
+
+###2.1 Load and Parse Classification Data
+
+```{r load-classification-data}
+# Load compound classification data
+data <- read_csv("data/foodb_analyse/source_id_classifications_complete.csv", quote = "\"")
+
+# Function to parse data from the existing format
+parse_data <- function(data) {
+  # Create empty dataframe to store results
+  result <- data.frame(
+    source_id = numeric(nrow(data)),
+    orig_source_name = character(nrow(data)),
+    subklass = character(nrow(data)),
+    classification1 = character(nrow(data)),
+    classification2 = character(nrow(data)),
+    stringsAsFactors = FALSE
+  )
+  
+  # Process each row
+  for (i in 1:nrow(data)) {
+    # Get the text from the first column
+    text <- as.character(data[i, 1])
+    
+    # Extract source_id (numbers at the beginning)
+    source_id <- as.numeric(sub("^(\\d+),.*", "\\1", text))
+    
+    # Extract all quoted values
+    matches <- gregexpr('"([^"]*)"', text)
+    extracted <- regmatches(text, matches)[[1]]
+    extracted <- gsub('"', '', extracted)
+    
+    # Assign values to the result dataframe
+    result[i, "source_id"] <- source_id
+    if (length(extracted) >= 1) result[i, "orig_source_name"] <- extracted[1]
+    if (length(extracted) >= 2) result[i, "subklass"] <- extracted[2]
+    if (length(extracted) >= 3) result[i, "classification1"] <- extracted[3]
+    if (length(extracted) >= 4) result[i, "classification2"] <- extracted[4]
+  }
+  
+  return(result)
+}
+
+# Parse the data
+classification_df <- parse_data(data)
+
+# Show unique values for classification1 and classification2
+unique_class1 <- unique(classification_df$classification1)
+unique_class2 <- unique(classification_df$classification2)
+
+cat("Unique values in classification1:\n")
+print(unique_class1)
+
+cat("\nUnique values in classification2:\n")
+print(unique_class2)
+```
+
+###2.2 Define Classification Filters
+
+```{r define-classification-filters}
+# Define which classifications to include
+classification1_filter <- c("Tyrosine","Alanine","Leucine","Thiamin","Aspartic acid","Cystine","Tryptophan","Phenylalanine",
+                            "Valine","Proline","Arginine","Histidine","Isoleucine","Methionine","Lysine",
+                            "Threonine","Serine","Glycine", "Glutamic acid") 
+
+#c("Tyrosine","Alanine","Leucine","Thiamin","Capric acid","Aspartic acid","Caproic acid", "Cystine",
+#                            "Tryptophan","Vaccenic acid","Pentadecanoic acid","Butyric acid","Myristoleic acid","Phenylalanine",
+#                            "Valine","Proline","Arginine","DH acid","Histidine","Isoleucine","Methionine","Lysine", "Threonine",
+#                            "Vitamin B6","Arachidonic acid","Glutamic acid","Serine","Glycine","Sugar","Heptadecanoic acid")
+
+classification2_filter <- c("Amino acid","Important vitamin","Sugar","Vaccenic acid","DH acid","Heptadecanoic acid",
+                            "Pentadecanoic acid","Arachidonic acid","Capric acid","Butyric acid","S amino acid","Myristoleic acid",
+                            "Caproic acid")
+```
+
+###2.3 Create Aggregated Datasets by Classification Type
+
+```{r create-aggregated-datasets}
+# Function to create an aggregated dataset based on a classification column
+create_aggregated_dataset <- function(classification_column, filter_values) {
+  # Get the mapping of source_id to classification value
+  source_id_to_class <- classification_df %>%
+    dplyr::select(source_id, !!sym(classification_column)) %>%
+    filter(!!sym(classification_column) %in% filter_values) %>%
+    distinct()
+  
+  # Get list of source_ids that match the filter
+  filtered_source_ids <- source_id_to_class$source_id %>% as.character()
+  
+  # If no matching source IDs, return NULL
+  if (length(filtered_source_ids) == 0) {
+    cat("No compounds match the filter for", classification_column, "\n")
+    return(NULL)
+  }
+  
+  # Filter recepten to include only these source_ids
+  filtered_recepten <- recepten %>%
+    dplyr::select(orig_food_id, one_of(filtered_source_ids))
+  
+  # Create a new dataframe to hold the aggregated data
+  aggregated_data <- filtered_recepten %>%
+   dplyr::select(orig_food_id) # Start with just the ID column
+  
+  # For each unique classification value in our filter
+  for (class_value in filter_values) {
+    # Get the source_ids that belong to this classification
+    class_source_ids <- source_id_to_class %>%
+      filter(!!sym(classification_column) == class_value) %>%
+      pull(source_id) %>%
+      as.character()
+    
+    # If we have source_ids for this classification
+    if (length(class_source_ids) > 0) {
+      # Sum the values across all compounds in this classification
+      # First check if any of the columns exist in filtered_recepten
+      existing_cols <- intersect(class_source_ids, colnames(filtered_recepten))
+      
+      if (length(existing_cols) > 0) {
+        # Sum the values for this classification
+        aggregated_data[[class_value]] <- rowSums(filtered_recepten[, existing_cols], na.rm = TRUE)
+      } else {
+        # If no columns exist, add a column of zeros
+        aggregated_data[[class_value]] <- 0
+      }
+    }
+  }
+  
+  # Print info about the aggregated dataset
+  cat("Created aggregated dataset for", classification_column, ":\n")
+  cat("- Number of classification categories:", ncol(aggregated_data) - 1, "\n")
+  cat("- Number of samples:", nrow(aggregated_data), "\n")
+  
+  return(aggregated_data)
+}
+
+# Create aggregated datasets
+aggregated_class1 <- create_aggregated_dataset("classification1", classification1_filter)
+aggregated_class2 <- create_aggregated_dataset("classification2", classification2_filter)
+
+#lamb/mutton eruit halen voor taste test statistics:
+mutton_ids <- metadata[metadata$food_id == 483, "orig_food_id"]
+mutton_id_vector <- mutton_ids$orig_food_id
+aggregated_class1 <- aggregated_class1[!aggregated_class1$orig_food_id %in% mutton_id_vector, ]
+```
+
+###2.4 Add imputation values + new compounds
+
+```{r join data}
+# First, join animal type information to your dataset
+aggregated_class1_with_animal <- aggregated_class1 %>%
+  left_join(metadata %>% dplyr::select(orig_food_id, animal_type), by = "orig_food_id")
+
+# Set random seed for reproducibility
+set.seed(42)
+
+# Define all compound parameters in a more organized structure
+# Format: compound_name = list(animal_type = list(mean = X, sd = Y, specific_ids = list(...)))
+compound_params <- list(
+  "Glutamic acid" = list(
+    chicken = list(mean = 4130, sd = 20)  # Only update chicken
+  ),
+  #"Arachidonic acid" = list(
+   # beef = list(mean = 28, sd = 5),
+  #  pork = list(mean = 54, sd = 5),
+   # chicken = list(mean = 43, sd = 0)  # Fixed value for chicken
+  #),
+  "IMP" = list(
+    beef = list(mean = 108.61, sd = 3.23),
+    pork = list(mean = 83.3, sd = 4.88),
+    chicken = list(
+      specific_ids = list(
+        "36014" = 83.7,
+        "36015" = 44.6,
+        "36016" = 44.6
+      )
+    )
+  ),
+ # "Inosine" = list(
+  #  beef = list(mean = 50.19, sd = 2.41),
+   # pork = list(mean = 89.7, sd = 4.29),
+   # chicken = list(
+    #  specific_ids = list(
+    #    "36014" = 36.2,
+     #   "36015" = 28.5,
+      #  "36016" = 28.5
+      #)
+    #)
+  #),
+  #"Glucose" = list(
+   # beef = list(mean = 165.39, sd = 6.48),
+    #pork = list(mean = 165.75, sd = 17.24),
+    #chicken = list(
+     # specific_ids = list(
+      #  "36014" = 40.4,
+       # "36015" = 17.4,
+      #  "36016" = 17.4
+      #)
+    #)
+  #),
+  "Ribose" = list(
+    beef = list(mean = 18.92, sd = 0.9),
+    pork = list(mean = 22.52, sd = 6.78),
+    chicken = list(
+      specific_ids = list(
+        "36014" = 24.7,
+        "36015" = 14.1,
+        "36016" = 14.1
+      )
+    )
+  )
+)
+
+# Add new columns if they don't exist
+new_columns <- c("IMP", "Ribose")
+
+# Create a copy of the original dataframe for imputations
+aggregated_class1_imputations <- aggregated_class1
+
+# Add any missing columns to both dataframes
+for (col in new_columns) {
+  if (!(col %in% names(aggregated_class1))) {
+    aggregated_class1[[col]] <- 0
+  }
+  if (!(col %in% names(aggregated_class1_imputations))) {
+    aggregated_class1_imputations[[col]] <- 0
+  }
+}
+
+# Function to update a column based on parameters
+update_column <- function(data, column_name, params) {
+  # Make a copy of the original data
+  updated_data <- data
+  
+  # Debug information
+  cat("Updating column:", column_name, "\n")
+  
+  for (animal_type in names(params)) {
+    animal_params <- params[[animal_type]]
+    
+    # Get rows for this animal type
+    animal_rows <- which(aggregated_class1_with_animal$animal_type == animal_type)
+    
+    cat("  Animal type:", animal_type, "- Found", length(animal_rows), "rows\n")
+    
+    if (length(animal_rows) == 0) next
+    
+    # Check if there are specific ID mappings
+    if (!is.null(animal_params$specific_ids)) {
+      cat("  Using specific ID mappings for", animal_type, "\n")
+      for (id in names(animal_params$specific_ids)) {
+        id_rows <- which(as.character(aggregated_class1_with_animal$orig_food_id) == id)
+        if (length(id_rows) > 0) {
+          cat("    Setting value", animal_params$specific_ids[[id]], "for ID", id, "\n")
+          updated_data[[column_name]][id_rows] <- animal_params$specific_ids[[id]]
+        }
+      }
+    } else {
+      # Use mean and SD for distribution
+      mean_val <- animal_params$mean
+      sd_val <- animal_params$sd
+      
+      cat("  Using distribution for", animal_type, "with mean:", mean_val, "SD:", sd_val, "\n")
+      
+      if (sd_val > 0) {
+        # Generate values from normal distribution
+        values <- rnorm(length(animal_rows), mean = mean_val, sd = sd_val)
+        # Ensure no negative values
+        values <- pmax(values, 0)
+      } else {
+        # Use fixed values when SD is 0
+        values <- rep(mean_val, length(animal_rows))
+      }
+      
+      # Assign values
+      updated_data[[column_name]][animal_rows] <- values
+      
+      # Verify the assignment worked
+      cat("  After update, mean value:", mean(updated_data[[column_name]][animal_rows]), "\n")
+    }
+  }
+  
+  return(updated_data)
+}
+
+# Update all columns in the imputations dataframe
+for (column_name in names(compound_params)) {
+  aggregated_class1_imputations <- update_column(aggregated_class1_imputations, column_name, compound_params[[column_name]])
+}
+
+# Print summary to verify updates
+summary_stats <- data.frame(
+  Compound = character(),
+  Animal_Type = character(),
+  Count = numeric(),
+  Mean = numeric(),
+  SD = numeric(),
+  Min = numeric(),
+  Max = numeric(),
+  stringsAsFactors = FALSE
+)
+
+for (column_name in names(compound_params)) {
+  for (animal_type in names(compound_params[[column_name]])) {
+    animal_rows <- which(aggregated_class1_with_animal$animal_type == animal_type)
+    if (length(animal_rows) > 0) {
+      values <- aggregated_class1_imputations[[column_name]][animal_rows]
+      stats <- data.frame(
+        Compound = column_name,
+        Animal_Type = animal_type,
+        Count = length(values),
+        Mean = mean(values),
+        SD = sd(values),
+        Min = min(values),
+        Max = max(values)
+      )
+      summary_stats <- rbind(summary_stats, stats)
+    }
+  }
+}
+
+# Display summary statistics
+print(summary_stats)
+```
+
+###3.5 Filter rows with zero values since these cause problems for compositional data.
+
+```{r enhanced_nonzero_distribution}
+# Modified function to just return the filtered dataframe
+create_nonzero_distribution_graph <- function(data, filter_threshold = NULL, preserve_ids = NULL) {
+  # Get compound columns (all except ID)
+  compound_cols <- setdiff(colnames(data), "orig_food_id")
+  
+  # Calculate percentage of non-zero values for each row
+  nonzero_percentages <- data %>%
+    rowwise() %>%
+    mutate(
+      nonzero_count = sum(c_across(all_of(compound_cols)) > 0),
+      nonzero_percent = 100 * nonzero_count / length(compound_cols)
+    ) %>%
+    ungroup() %>%
+    dplyr::select(orig_food_id, nonzero_percent)
+  
+  # Create a sequence of thresholds from 0 to 100%
+  thresholds <- seq(0, 100, by = 5)
+  
+  # Calculate the percentage of rows meeting each threshold
+  rows_meeting_threshold <- sapply(thresholds, function(threshold) {
+    sum(nonzero_percentages$nonzero_percent >= threshold)
+  })
+  
+  # Calculate percentage of rows remaining
+  total_rows <- nrow(data)
+  percent_rows_remaining <- 100 * rows_meeting_threshold / total_rows
+  
+  # Create a data frame for plotting
+  plot_data <- data.frame(
+    threshold = thresholds,
+    rows_remaining = rows_meeting_threshold,
+    percent_remaining = percent_rows_remaining
+  )
+  
+  # Create the plot
+  p <- ggplot(plot_data, aes(x = threshold, y = percent_remaining)) +
+    geom_line(size = 1, color = "steelblue") +
+    geom_point(size = 3, color = "steelblue") +
+    geom_text(aes(label = paste0(round(percent_remaining, 1), "%")), 
+              vjust = -0.8, size = 3) +
+    labs(
+      title = "Sample Retention vs. Non-Zero Value Threshold",
+      subtitle = paste("Starting with", total_rows, "samples"),
+      x = "Minimum Percentage of Non-Zero Values Required",
+      y = "Percentage of Samples Retained"
+    ) +
+    scale_x_continuous(breaks = seq(0, 100, by = 10)) +
+    scale_y_continuous(limits = c(0, 100)) +
+    theme_bw() +
+    theme(
+      plot.title = element_text(size = 14, face = "bold"),
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 10)
+    )
+    
+  # Add vertical line for filter threshold if specified
+  if(!is.null(filter_threshold)) {
+    # Find the percentage at this threshold
+    threshold_percent <- plot_data$percent_remaining[plot_data$threshold == 
+                                                    filter_threshold - (filter_threshold %% 5)]
+    
+    p <- p + 
+      geom_vline(xintercept = filter_threshold, linetype = "dashed", color = "red") +
+      annotate("text", x = filter_threshold + 2, y = 50, 
+              label = paste0("Filter: ", filter_threshold, "%"), 
+              color = "red", angle = 90, hjust = 0.5)
+  }
+  
+  # Display the plot
+  print(p)
+  
+  # Create a table with key thresholds
+  key_thresholds <- c(0, 20, 40, 60, 80, 100)
+  threshold_table <- plot_data %>%
+    filter(threshold %in% key_thresholds) %>%
+    dplyr::select(threshold, rows_remaining, percent_remaining) %>%
+    mutate(percent_remaining = round(percent_remaining, 1))
+  
+  # Print threshold table
+  print(threshold_table)
+  
+  # Filter the data if a threshold is provided
+  if(!is.null(filter_threshold)) {
+    # Create filtering conditions
+    keep_by_threshold <- nonzero_percentages$nonzero_percent >= filter_threshold
+    
+    # Add preserved IDs if specified
+    if(!is.null(preserve_ids) && length(preserve_ids) > 0) {
+      keep_by_id <- nonzero_percentages$orig_food_id %in% preserve_ids
+      rows_to_keep <- keep_by_threshold | keep_by_id
+    } else {
+      rows_to_keep <- keep_by_threshold
+    }
+    
+    # Filter the dataset
+    filtered_data <- data[rows_to_keep, ]
+    
+    # Count preserved samples that would have been filtered out
+    preserved_count <- 0
+    if(!is.null(preserve_ids) && length(preserve_ids) > 0) {
+      preserved_count <- sum(!keep_by_threshold & keep_by_id)
+    }
+    
+    # Print summary of filtering
+    cat("Filtered dataset with >=", filter_threshold, "% non-zero values:\n")
+    cat("- Original samples:", nrow(data), "\n")
+    cat("- Remaining samples:", nrow(filtered_data), "\n")
+    cat("- Removed samples:", nrow(data) - nrow(filtered_data), "\n")
+    
+    if(preserved_count > 0) {
+      cat("- Preserved samples that would have been filtered out:", preserved_count, "\n")
+    }
+    
+    # Return just the filtered dataframe
+    return(filtered_data)
+  }
+  
+  # If no filtering was done, return the original data
+  return(data)
+}
+
+filtered_data <- create_nonzero_distribution_graph(
+  aggregated_class1_imputations, 
+  filter_threshold = 100,
+  preserve_ids = c(36014, 36015, 36016, 36017, 36018, 36021, 36022, 36023)
+)
+```
+
+###2.6 Analysis of filtered_data
+
+####2.6.1 PCA & outlier detectie
+
+```{r}
+# 1. Zet om naar compositie en voer CLR&ILR-transformatie uit
+filtered_acomp <- acomp(filtered_data %>% dplyr::select(-orig_food_id))
+filtered_clr <- clr(filtered_acomp)
+clr_df <- as.data.frame(filtered_clr)
+
+filtered_ilr <- ilr(filtered_acomp)
+ilr_df <- as.data.frame(filtered_ilr)
+
+# 2. PCA uitvoeren
+pca_result <- prcomp(ilr_df, center = TRUE, scale. = FALSE)
+
+# Voeg metadata toe
+ilr_df$orig_food_id <- filtered_data$orig_food_id
+ilr_df <- ilr_df %>%
+  left_join(metadata_with_cuts, by = "orig_food_id")
+
+# 3. Plotten in thesisstijl
+library(ggfortify)
+
+p <- autoplot(pca_result, 
+              data = ilr_df, 
+              colour = "animal_type", 
+              size = 3) +
+  scale_color_brewer(palette = "Set1", name = "Animal type") +
+  theme_classic(base_size = 14) +
+  labs(title = "PCA op CLR-transformatie van gefilterde receptendata") +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 12),
+    plot.title = element_text(size = 16, hjust = 0.5),
+    axis.title = element_text(size = 13),
+    axis.text = element_text(size = 12)
+  )
+
+p
+
+```
+
+Goede clustering, 2 outliers van pork bekijken en clustering binnen rund en varken nog eens bekijken via metadata over type cut.
+
+```{r}
+#Outliers verwijderen en nieuwe pca
+outlier_ids <- c(10105, 10109)
+# Create a filtered dataset without the outliers
+filtered_clean_data <- filtered_data %>%
+  filter(!orig_food_id %in% outlier_ids)
+
+# 1. Zet om naar compositie en voer CLR-transformatie uit
+filtered_acomp <- acomp(filtered_clean_data %>% dplyr::select(-orig_food_id))
+filtered_clr <- clr(filtered_acomp)
+clr_df <- as.data.frame(filtered_clr)
+
+filtered_ilr <- ilr(filtered_acomp)
+ilr_df <- as.data.frame(filtered_ilr)
+
+# 2. PCA uitvoeren
+pca_result <- prcomp(ilr_df, center = TRUE, scale. = FALSE)
+
+# Voeg metadata toe
+clr_df$orig_food_id <- filtered_clean_data$orig_food_id
+clr_df <- clr_df %>%
+  left_join(metadata_with_cuts, by = "orig_food_id")
+
+ilr_df$orig_food_id <- filtered_clean_data$orig_food_id
+ilr_df <- ilr_df %>%
+  left_join(metadata_with_cuts, by = "orig_food_id")
+
+# 3. Plotten in thesisstijl
+library(ggfortify)
+
+p <- autoplot(pca_result, 
+              data = ilr_df, 
+              colour = "animal_type", 
+              size = 3) +
+  scale_color_brewer(palette = "Set1", name = "Animal type") +
+  theme_classic(base_size = 14) +
+  labs(title = "PCA op ILR-transformatie van gefilterde receptendata, -2 outliers") +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 12),
+    plot.title = element_text(size = 16, hjust = 0.5),
+    axis.title = element_text(size = 13),
+    axis.text = element_text(size = 12)
+  )
+
+#plot
+pca_scores <- as.data.frame(pca_result$x)
+pca_scores$animal_type <- ilr_df$animal_type  # of ilr_df$meat_cut_type, afhankelijk van jouw kolomnaam
+pca_scores$animal_type <- factor(pca_scores$animal_type, 
+                                levels = c("beef", "pork", "chicken"))  # pas aan als nodig
+
+
+g <- ggplot(pca_scores, aes(x = PC1, y = PC2, color = animal_type)) +
+  geom_point(size = 3, alpha = 0.9) +
+  scale_color_manual(
+    values = c("beef" = "#E41A1C",   # rood
+               "pork" = "#FF7F00",   # oranje
+               "chicken" = "#377EB8"), # blauw
+    name = NULL
+  ) +
+  labs(
+    x = paste0("PC1 (", round(100 * summary(pca_result)$importance[2, 1], 1), "%)"),
+    y = paste0("PC2 (", round(100 * summary(pca_result)$importance[2, 2], 1), "%)")
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    legend.direction = "horizontal",
+    legend.box = "horizontal",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 11),
+    legend.key.size = unit(0.4, "cm"),
+    plot.title = element_blank(),
+    axis.title = element_text(size = 13),
+    axis.text = element_text(size = 12)
+  )
+
+g
+ggsave("C:/Users/bramd_finhsgu/OneDrive - UGent/Thesis/afbeeldingen/PCA_subset.png",
+       plot = g, width = 8, height = 5, dpi = 300)
+```
+
+####2.6.2 PERMANOVA
+
+```{r}
+clr_matrix <- filtered_clr  # dit is al zonder orig_food_id
+
+# Bereken Euclidische afstand op CLR-data
+dist_matrix <- dist(clr_matrix)
+
+# Voeg metadata toe (incl. animal_type)
+meta_data <- filtered_clean_data %>%
+  left_join(metadata_with_cuts, by = "orig_food_id")
+
+# Voer PERMANOVA uit
+permanova_result <- adonis2(dist_matrix ~ animal_type, data = meta_data, permutations = 999)
+
+# Toon resultaten
+print(permanova_result)
+```
+
+####2.6.3 binnendier analyse op vleescut
+
+```{r}
+# Filter voor beef & pork
+filtered_beef <- ilr_df %>% filter(animal_type == "pork")
+
+# PCA op enkel de variabelen (zonder ID's/labels)
+pca_beef <- prcomp(filtered_beef %>% dplyr::select(-orig_food_id, -animal_type, -orig_food_common_name, -meat_cut_type), 
+                   center = TRUE, scale. = FALSE)
+
+# Plot
+p <- autoplot(pca_beef, 
+         data = filtered_beef, 
+         colour = "meat_cut_type", 
+         size = 3) +
+  scale_color_brewer(palette = "Paired", name = "Meat cut") +
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 13),
+    legend.text = element_text(size = 12),
+    plot.title = element_text(size = 16, hjust = 0.5),
+    axis.title = element_text(size = 13),
+    axis.text = element_text(size = 12)
+  )
+
+ggsave("C:/Users/bramd_finhsgu/OneDrive - UGent/Thesis/afbeeldingen/PCA_pork2.png",
+       plot = p, width = 8, height = 5, dpi = 300)
+```
+
+####2.6.5 histogram
+
+```{r}
+# 1. Combineer met metadata
+histogram_data <- filtered_clean_data %>%
+  left_join(metadata_with_cuts, by = "orig_food_id")
+
+# 2. Lijst van compound-kolommen (alle behalve de ID)
+compound_cols <- setdiff(colnames(filtered_clean_data), "orig_food_id")
+
+# 3. Voor elke compound een histogram plotten
+for (compound in compound_cols) {
+  p <- ggplot(histogram_data, aes_string(x = paste0("`", compound, "`"), fill = "animal_type")) +
+    geom_histogram(bins = 15, color = "black", alpha = 0.7) +
+    facet_wrap(~ animal_type, scales = "free_y") +
+    scale_fill_manual(values = c(
+      "beef" = "#E41A1C",
+      "chicken" = "#4DAF4A",
+      "pork" = "#984EA3"
+    )) +
+    labs(
+      title = paste("Verdeling van", compound),
+      x = "Concentratie (mg/100g)",
+      y = "Aantal"
+    ) +
+    theme_bw() +
+    theme(
+      legend.position = "none",
+      plot.title = element_text(size = 12, face = "bold"),
+      strip.background = element_rect(fill = "lightgray"),
+      strip.text = element_text(face = "bold")
+    )
+  
+  print(p)
+}
+```
+
+
+####2.6.6 LDA
+
+```{r lda_meat_classification}
+# 1. Bereid data voor: selecteer features en class labels
+ilr_features <- ilr_df %>%
+  dplyr::select(-orig_food_id, -meat_cut_type, -food_id, -animal_type, -orig_food_common_name)  # verwijder ID en eventueel cut info
+class_labels <- ilr_df$animal_type
+
+# 2. Train/test-split (70% trainen, 30% testen)
+set.seed(123)
+train_idx <- createDataPartition(class_labels, p = 0.7, list = FALSE)
+
+X_train <- ilr_features[train_idx, ]
+y_train <- class_labels[train_idx]
+
+X_test <- ilr_features[-train_idx, ]
+y_test <- class_labels[-train_idx]
+
+# 3. Pas LDA toe
+lda_model <- lda(X_train, grouping = y_train)
+
+# 4. Voorspel testdata
+lda_pred <- predict(lda_model, X_test)
+y_pred <- lda_pred$class
+
+# 5. Confusion matrix & accuraatheid
+conf_matrix <- confusionMatrix(factor(y_pred), factor(y_test))
+accuracy <- mean(y_pred == y_test)
+
+cat("LDA accuracy:", round(accuracy * 100, 1), "%\n\n")
+print(conf_matrix)
+
+# 6. Plot LDA (indien ≥2 LD’s)
+lda_train_scores <- as.data.frame(predict(lda_model, X_train)$x)
+lda_train_scores$class <- y_train
+lda_train_scores$set <- "Training"
+
+lda_test_scores <- as.data.frame(predict(lda_model, X_test)$x)
+lda_test_scores$class <- y_test
+lda_test_scores$set <- "Test"
+
+lda_scores_all <- rbind(lda_train_scores, lda_test_scores)
+
+# Veronderstel dat je ilr_df een kolom orig_food_id heeft en in dezelfde volgorde staat als lda_scores_all
+lda_scores_all$orig_food_id <- ilr_df$orig_food_id[as.numeric(rownames(lda_scores_all))]
+
+if ("LD2" %in% colnames(lda_scores_all)) {
+  p <- ggplot(lda_scores_all, aes(x = LD1, y = LD2, color = class, shape = set)) +
+    geom_point(aes(size = ifelse(set == "Test", 3, 2.5)), alpha = 0.8) +
+    stat_ellipse(aes(group = class), type = "t", linetype = "dashed", size = 1, alpha = 0.7) +
+    labs(
+      x = "LD1", y = "LD2",
+      color = "Meat type",
+      shape = "Dataset"
+    ) +
+    scale_color_manual(values = c("beef" = "#E41A1C", "pork" = "#FF7F00", "chicken" = "#377EB8")) +
+    scale_shape_manual(values = c("Training" = 17, "Test" = 16)) +
+    scale_size_identity() +
+    theme_minimal(base_size = 14) +
+    theme(
+      panel.grid.major = element_blank(),
+      panel.grid.minor = element_blank(),
+      axis.line = element_line(color = "black"),
+      legend.position = "bottom",
+      legend.box = "horizontal",
+      legend.title = element_text(size = 12),
+      legend.text = element_text(size = 11),
+      axis.title = element_text(size = 14)
+    ) +
+    guides(color = guide_legend(order = 1, override.aes = list(size=4)),
+           shape = guide_legend(order = 2))
+  
+  ggsave(filename = "C:/Users/bramd_finhsgu/OneDrive - UGent/Thesis/afbeeldingen/LDA_plot.png",
+         plot = p, width = 10, height = 8, dpi = 300)
+} else {
+  cat("Slechts 1 discriminant gevonden, geen LD2 beschikbaar voor plot.\n")
+}
+
+
+# 7. Top 10 meest discriminerende componenten
+lda_coeffs <- as.data.frame(lda_model$scaling)
+top_ld1 <- lda_coeffs %>%
+  mutate(compound = rownames(.), abs_val = abs(LD1)) %>%
+  arrange(desc(abs_val)) %>%
+  select(compound, LD1) %>%
+  head(10)
+
+cat("\nTop 10 belangrijkste componenten voor LD1:\n")
+print(top_ld1)
+```
+
+####2.2.7 Random forrests
+
+```{r}
+# Paketten laden
+library(randomForest)
+library(caret)
+library(dplyr)
+library(ggplot2)
+library(randomForestExplainer)
+
+# 1. Selecteer enkel predictoren (geen metadata)
+clr_features <- clr_df %>%
+  dplyr::select(-orig_food_id, -meat_cut_type, -food_id, -animal_type, -orig_food_common_name)
+
+# 2. Extract labels (alle diergroepen)
+labels <- factor(clr_df$animal_type)
+
+# 3. Handmatige splitsing voor kippen
+chicken_idx <- which(labels == "chicken")
+set.seed(123)
+chicken_train <- sample(chicken_idx, 2)
+chicken_test <- setdiff(chicken_idx, chicken_train)
+
+# Stratificatie voor overige diergroepen
+non_chicken_idx <- which(labels != "chicken")
+non_chicken_labels <- labels[non_chicken_idx]
+non_chicken_train_idx <- createDataPartition(non_chicken_labels, p = 0.7, list = FALSE)
+non_chicken_train <- non_chicken_idx[non_chicken_train_idx]
+non_chicken_test <- setdiff(non_chicken_idx, non_chicken_train)
+
+# Combineer indices
+train_idx <- c(non_chicken_train, chicken_train)
+test_idx <- c(non_chicken_test, chicken_test)
+
+# 4. Bouw train/test sets
+train_x <- clr_features[train_idx, ]
+train_y <- labels[train_idx]
+test_x <- clr_features[test_idx, ]
+test_y <- labels[test_idx]
+
+# 5. Train Random Forest
+rf_model <- randomForest(
+  x = train_x,
+  y = train_y,
+  ntree = 1000,
+  importance = TRUE
+)
+
+# 6. Voorspel testdata en evalueer
+rf_pred <- predict(rf_model, newdata = test_x)
+conf_matrix <- confusionMatrix(rf_pred, test_y)
+
+cat("✅ Random Forest Accuracy:", round(conf_matrix$overall["Accuracy"] * 100, 2), "%\n\n")
+print(conf_matrix)
+
+# 7. Variable importance
+importance_df <- as.data.frame(importance(rf_model)) %>%
+  tibble::rownames_to_column("compound") %>%
+  arrange(desc(MeanDecreaseAccuracy))
+
+cat("\nTop 10 belangrijkste componenten (op basis van accuratesse):\n")
+print(head(importance_df[, c("compound", "MeanDecreaseAccuracy")], 10))
+
+# 8. Variable importance plot
+ggplot(head(importance_df, 15), aes(x = reorder(compound, MeanDecreaseAccuracy), 
+                                    y = MeanDecreaseAccuracy)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  theme_bw() +
+  labs(title = "Top 15 belangrijkste variabelen (Random Forest)",
+       x = "Compound", y = "Mean Decrease Accuracy")
+
+p <- ggplot(head(importance_df, 15), aes(x = reorder(compound, MeanDecreaseAccuracy), 
+                                    y = MeanDecreaseAccuracy)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(x = NULL, y = "Mean Decrease Accuracy") +  # x-as label weg, y-as label behouden
+  theme_minimal(base_size = 14) +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    axis.line = element_line(color = "black"),
+    axis.title.y = element_blank(),  # y-as label (compound) weg
+    axis.text.y = element_text(size = 12),
+    axis.text.x = element_text(size = 12)
+  )
+
+ggsave("C:/Users/bramd_finhsgu/OneDrive - UGent/Thesis/afbeeldingen/variable_importance.png",
+       plot = p, width = 8, height = 5, dpi = 300)
+```
+
+####2.2.8 SOM
+
+```{r}
+# 📦 Vereiste libraries
+library(kohonen)
+library(viridis)
+library(dplyr)
+library(ggplot2)
+
+# 1. Data voorbereiden (jouw originele)
+clr_features <- clr_df %>%
+  dplyr::select(-orig_food_id, -meat_cut_type, -food_id, -animal_type, -orig_food_common_name)
+clr_scaled <- scale(as.matrix(clr_features))
+sample_ids <- clr_df$orig_food_id
+labels <- clr_df$animal_type
+
+# 2. SOM initialiseren en trainen
+set.seed(123)
+som_grid <- somgrid(xdim = 10, ydim = 10, topo = "hexagonal")
+som_model <- som(
+  X = clr_scaled,
+  grid = som_grid,
+  rlen = 2000,
+  alpha = c(0.05, 0.005),
+  radius = c(3, 0.5),
+  keep.data = TRUE
+)
+
+# 3. SOM-resultaten koppelen aan metadata
+som_results <- data.frame(
+  orig_food_id = sample_ids,
+  node = som_model$unit.classif,
+  group = labels
+)
+
+# 4. Voeg node x,y toe aan elk sample (zorg dat per rij geüpdatet wordt!)
+som_results <- som_results %>%
+  rowwise() %>%
+  mutate(
+    x = som_model$grid$pts[node, 1],
+    y = som_model$grid$pts[node, 2]
+  ) %>%
+  ungroup()
+
+# 5. Maak hexagon vertices functie (voor grid achtergrond)
+hex_coords <- function(x, y, size = 1) {
+  angle <- seq(0, 2 * pi, length.out = 7)
+  data.frame(
+    x_hex = x + size * cos(angle),
+    y_hex = y + size * sin(angle)
+  )
+}
+
+# 6. Maak hexagon grid dataframe voor alle nodes
+hex_grid <- do.call(rbind, lapply(1:nrow(som_model$grid$pts), function(i) {
+  cbind(node = i, hex_coords(som_model$grid$pts[i, 1], som_model$grid$pts[i, 2], size = 1))
+}))
+
+# 7. Definieer kleuren
+group_colors <- c("beef" = "#E41A1C", "pork" = "#FF7F00", "chicken" = "#377EB8")
+
+# ⬛ Coördinaten per neuron (grid) + samplecoördinaten op grid
+som_grid_df <- data.frame(
+  node = 1:nrow(som_model$grid$pts),
+  x = som_model$grid$pts[, 1],
+  y = som_model$grid$pts[, 2]
+)
+
+# Dominante groep per neuron
+dominant_group <- som_results %>%
+  group_by(node, group) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  slice_max(n, n = 1, with_ties = FALSE)
+
+# Hexgrid vullen met dominante groep
+hex_grid_filled <- hex_grid %>%
+  left_join(dominant_group, by = "node")
+
+# Sampleposities toevoegen (voor bolletjes)
+sample_positions <- som_results %>%
+  left_join(som_grid_df, by = "node")
+
+# SOM-plot
+som_plot <- ggplot() +
+  # dominante groep per hex
+  geom_polygon(data = hex_grid_filled, aes(x = x, y = y, group = node, fill = group),
+               color = "black", linewidth = 0.6, alpha = 0.25) +
+  # individuele samples
+  geom_point(data = sample_positions, aes(x = x.x, y = y.x, color = group),
+             size = 1.5, alpha = 0.9, position = position_jitter(width = 0.2, height = 0.2)) +
+  scale_fill_manual(values = group_colors, guide = "none") +
+  scale_color_manual(values = group_colors) +
+  coord_equal() +
+  theme_void(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11)
+  ) +
+  guides(color = guide_legend(title = "Group", nrow = 1))
+
+som_plot
+# Opslaan
+ggsave("C:/Users/bramd_finhsgu/OneDrive - UGent/Thesis/afbeeldingen/SOM.png",
+       plot = som_plot, width = 8, height = 6, dpi = 300)
+
+# Afstandsmatrix op codebook vectors
+codes <- som_model$codes[[1]]
+dist_matrix <- as.matrix(dist(codes))
+
+# Buren bepalen
+neighbors <- lapply(1:nrow(som_model$grid$pts), function(i) {
+  dists <- sqrt(rowSums((som_model$grid$pts - matrix(som_model$grid$pts[i, ],
+                                                     nrow = nrow(som_model$grid$pts),
+                                                     ncol = 2, byrow = TRUE))^2))
+  which(dists > 0 & dists < 1.5)
+})
+
+# Gemiddelde afstand tot buren (U-matrixwaarde)
+u_values <- sapply(1:length(neighbors), function(i) {
+  if (length(neighbors[[i]]) > 0) {
+    mean(dist_matrix[i, neighbors[[i]]])
+  } else {
+    NA
+  }
+})
+
+# U-matrix dataframe
+u_matrix_df <- data.frame(
+  node = 1:nrow(som_model$grid$pts),
+  u_value = u_values
+)
+
+# Voeg toe aan hexgrid
+hex_grid_u <- hex_grid %>%
+  left_join(u_matrix_df, by = "node")
+
+# U-matrix plot
+u_plot <- ggplot(hex_grid_u, aes(x = x, y = y, group = node, fill = u_value)) +
+  geom_polygon(color = "white", linewidth = 0.3) +
+  scale_fill_viridis_c(option = "magma", direction = -1, na.value = "grey90") +
+  coord_equal() +
+  theme_void(base_size = 14) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11)
+  ) +
+  labs(fill = "U-matrix waarde")
+
+# Opslaan
+ggsave("C:/Users/bramd_finhsgu/OneDrive - UGent/Thesis/afbeeldingen/Umatrix.png",
+       plot = u_plot, width = 8, height = 6, dpi = 300)
+
+u_plot
+```
+
+```{r}
+# 8. Verbeterde SOM-plot met correcte dominante groep, dikke randen en samplepunten
+
+library(tidyr)
+
+# Maak dataframe met dominante groep per node
+dominant_group <- som_results %>%
+  group_by(node, group) %>%
+  summarise(n = n(), .groups = "drop") %>%
+  group_by(node) %>%
+  slice_max(n, n = 1, with_ties = FALSE)
+
+# Voeg missing nodes toe met NA als group zodat alle nodes in hex_grid_filled zitten
+all_nodes <- data.frame(node = 1:nrow(som_model$grid$pts))
+dominant_group_full <- all_nodes %>%
+  left_join(dominant_group, by = "node")
+
+# Combineer met hex_grid
+hex_grid_filled <- hex_grid %>%
+  left_join(dominant_group_full, by = "node")
+
+# Voeg sample posities toe
+som_grid_df <- data.frame(
+  node = 1:nrow(som_model$grid$pts),
+  x = som_model$grid$pts[,1],
+  y = som_model$grid$pts[,2]
+)
+
+sample_positions <- som_results %>%
+  left_join(som_grid_df, by = "node")
+
+# Plot SOM met dominantie als achtergrondkleur en samplepunten
+g <- ggplot() +
+  geom_polygon(data = hex_grid_filled,
+               aes(x = x, y = y, group = node, fill = group),
+               color = "black", linewidth = 0.9, alpha = 0.3) +
+  geom_point(data = sample_positions,
+             aes(x = x.x, y = y.x, color = group),
+             size = 2, alpha = 0.9, position = position_jitter(width = 0.2, height = 0.2)) +
+  scale_fill_manual(values = group_colors, na.value = "white", guide = "none") +
+  scale_color_manual(values = group_colors) +
+  coord_equal() +
+  theme_void(base_size = 14) +
+  theme(
+    legend.position = "bottom",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11)
+  ) +
+  guides(color = guide_legend(title = "Group", nrow = 1))
+
+ggsave("C:/Users/bramd_finhsgu/OneDrive - UGent/Thesis/afbeeldingen/SOM.png",
+       plot = g, width = 8, height = 6, dpi = 300)
+g
+# 9. U-matrix met exact dezelfde hexgrid, zonder punten of clusterkleuren
+
+codes <- som_model$codes[[1]]
+dist_matrix <- as.matrix(dist(codes))
+
+neighbors <- lapply(1:nrow(som_model$grid$pts), function(i) {
+  dists <- sqrt(rowSums((som_model$grid$pts - matrix(som_model$grid$pts[i, ],
+                                                     nrow = nrow(som_model$grid$pts),
+                                                     ncol = 2,
+                                                     byrow = TRUE))^2))
+  which(dists < 1.5 & dists > 0)
+})
+
+u_values <- sapply(1:nrow(codes), function(i) {
+  if(length(neighbors[[i]]) > 0) {
+    mean(dist_matrix[i, neighbors[[i]]])
+  } else {
+    NA
+  }
+})
+
+u_matrix_df <- data.frame(
+  node = 1:nrow(som_model$grid$pts),
+  u_value = u_values
+)
+
+hex_grid_u <- hex_grid %>%
+  left_join(u_matrix_df, by = "node")
+
+p <- ggplot(hex_grid_u, aes(x = x, y = y, group = node, fill = u_value)) +
+  geom_polygon(color = "black", linewidth = 0.9) +
+  scale_fill_viridis_c(option = "plasma", direction = -1, na.value = "grey90") +
+  coord_equal() +
+  theme_void(base_size = 14) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11)
+  ) +
+  labs(fill = "Euclidian distance")
+
+ggsave("C:/Users/bramd_finhsgu/OneDrive - UGent/Thesis/afbeeldingen/Umatrix.png",
+       plot = p, width = 8, height = 6, dpi = 300)
+
+# Toon plots
+g
+p
+
+```
+
+```{r}
+# 9. U-matrix met exact dezelfde hexgridstructuur als SOM (visueel consistent)
+
+# U-matrix data met echte hexagonen
+u_matrix_plot_df <- som_grid_df %>%
+  left_join(u_matrix_df, by = "node") %>%
+  rowwise() %>%
+  mutate(polygon = list(hex_coords(x, y, size = 1))) %>%
+  unnest(cols = c(polygon))
+
+# Plot
+p <- ggplot(u_matrix_plot_df, aes(x = x_hex, y = y_hex, group = node, fill = u_value)) +
+  geom_polygon(color = "black", linewidth = 0.9) +
+  coord_equal() +
+  scale_fill_viridis_c(option = "plasma", direction = -1, na.value = "grey90") +
+  theme_void(base_size = 14) +
+  theme(
+    legend.position = "right",
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11)
+  ) +
+  labs(fill = "Euclidean distance")
+
+p
+
+ggsave("C:/Users/bramd_finhsgu/OneDrive - UGent/Thesis/afbeeldingen/Umatrix_updated.png",
+       plot = p, width = 8, height = 6, dpi = 300)
+
+```
+
