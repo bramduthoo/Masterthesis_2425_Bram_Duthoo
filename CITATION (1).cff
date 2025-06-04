@@ -1,0 +1,18 @@
+# This CITATION.cff file was generated with cffinit.
+# Visit https://bit.ly/cffinit to generate yours today!
+
+cff-version: 1.2.0
+title: Masterthesis_2425_Bram_Duthoo
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - given-names: Bram
+    family-names: Duthoo
+    email: bram.duthoo@gmail.com
+repository-code: >-
+  https://github.com/Kermit-UGent/Masterthesis_2425_Bram_Duthoo
+license: MIT
+version: final-thesis-submission
+date-released: '2025-06-06'
